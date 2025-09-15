@@ -391,7 +391,21 @@
     const fd = new FormData(); fd.append('file', file);
     try{
       const res = await fetch(`${BACKEND_BASE.replace(/\/$/,'')}/preview`, { method:'POST', body: fd });
-      if(!res.ok){ setStatus('Backend error '+res.status); return; }
+      if (!res.ok) {
+        let msg = 'Backend error ' + res.status;
+        try {
+          const t = await res.text();
+          try {
+            const j = JSON.parse(t);
+            msg += j.error ? `: ${j.error}` : '';
+            if (j.detail) msg += ` • ${JSON.stringify(j.detail).slice(0,300)}`;
+          } catch {
+            msg += ` • ${t.slice(0,300)}`;
+          }
+        } catch {}
+        setStatus(msg);
+        return;
+      }
       const data = await res.json();
       showPreview(data);
       setStatus('Ready.');
