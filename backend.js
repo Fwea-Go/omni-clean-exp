@@ -38,41 +38,62 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     if(!req.file) return res.status(400).json({ error:'missing_file' });
     const src = req.file.path;
 
-    // Create a small 25–30s Opus proxy for Whisper (keeps body < ~3 MB)
-    // We'll try a couple of bitrates if the file is still too large.
-    const mkProxy = (brKbps) => new Promise((resolve, reject) => {
+    // --- Make a tiny Opus proxy for Whisper (hard cap ≤ ~2.6 MB) ---
+    // Strategy: aggressively downsample + trim; try a few profiles.
+    const mkProxy = (brKbps, seconds) => new Promise((resolve, reject) => {
       proxy = path.join('uploads', `${Date.now().toString(36)}_proxy.ogg`);
       const args = [
         '-hide_banner','-loglevel','error','-y',
         '-i', src,
-        '-t','25',           // a little shorter is fine for detection
-        '-ac','1',           // mono
-        '-ar','16000',       // 16 kHz
-        '-c:a','libopus',    // Opus is very efficient
+        '-t', String(seconds),   // trim to N seconds for preview/transcription
+        '-ac','1',               // mono
+        '-ar','16000',           // 16 kHz
+        '-c:a','libopus',        // very efficient + widely supported
+        '-application','voip',   // prioritize speech
+        '-compression_level','10',
         '-b:a', `${brKbps}k`,
         '-vbr','on',
         proxy
       ];
-      const cmd = `ffmpeg ${args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')}`;
+      const cmd = `ffmpeg ${args.map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ')}`;
       exec(cmd, (e, _so, se) => e ? reject(se) : resolve());
     });
 
-    // Try 32k, then 24k, then 16k until size < 3 MB
-    const targets = [32, 24, 16];
-    let made = false;
-    for (const kb of targets) {
-      await mkProxy(kb);
+    // Try progressively smaller profiles until size ≤ 2.6 MB
+    // (Cloudflare rejects larger request bodies on this endpoint.)
+    const profiles = [
+      { br: 14, t: 25 },
+      { br: 12, t: 25 },
+      { br: 10, t: 22 },
+      { br:  8, t: 20 },
+      { br:  8, t: 18 },
+    ];
+    let okProxy = false;
+    for (const p of profiles) {
+      // delete any prior attempt
+      try { if (proxy && fs.existsSync(proxy)) fs.unlinkSync(proxy); } catch {}
+      await mkProxy(p.br, p.t);
       try {
-        const sz = fs.statSync(proxy).size;
-        if (sz <= 3_000_000) { made = true; break; }
-      } catch { /* ignore and fall through */ }
-      try { if (proxy && fs.existsSync(proxy)) fs.unlinkSync(proxy); } catch(_){}
+        const bytes = fs.statSync(proxy).size;
+        if (bytes <= 2_600_000) { okProxy = true; break; }
+      } catch { /* keep trying */ }
     }
-    if (!made) {
-      // last try at 12k if still too big
-      await mkProxy(12);
+    if (!okProxy) {
+      // Final guard: re-open at the smallest profile again
+      try { if (proxy && fs.existsSync(proxy)) fs.unlinkSync(proxy); } catch {}
+      await mkProxy(8, 18);
     }
-  
+
+    // Load proxy data and bail out if still too large
+    let buf = Buffer.alloc(0);
+    try { buf = fs.readFileSync(proxy); } catch {}
+    if (!buf.length || buf.length > 2_600_000) {
+      return res.status(413).json({
+        error: 'proxy_too_large',
+        detail: { size_bytes: buf.length || 0, hint: 'Please try a shorter clip (≤20s) or lower quality source.' }
+      });
+    }
+
     const account = process.env.CF_ACCOUNT_ID || '';
     const token   = process.env.CF_API_TOKEN  || '';
     if(!account || !token) return res.status(500).json({ error:'cloudflare_credentials_missing' });
