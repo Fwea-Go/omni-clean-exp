@@ -38,22 +38,41 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     if(!req.file) return res.status(400).json({ error:'missing_file' });
     const src = req.file.path;
 
-    // Create a small 30s proxy for Whisper (Free tier has ~4MB upload cap)
-    proxy = path.join('uploads', `${Date.now().toString(36)}_proxy.mp3`);
-    await new Promise((resolve,reject)=>{
-      const proxyArgs = [
+    // Create a small 25–30s Opus proxy for Whisper (keeps body < ~3 MB)
+    // We'll try a couple of bitrates if the file is still too large.
+    const mkProxy = (brKbps) => new Promise((resolve, reject) => {
+      proxy = path.join('uploads', `${Date.now().toString(36)}_proxy.ogg`);
+      const args = [
         '-hide_banner','-loglevel','error','-y',
         '-i', src,
-        '-t','30',        // limit duration
-        '-ac','1',        // mono
-        '-ar','16000',    // 16 kHz
-        '-b:a','48k',     // 48 kbps keeps most clips <4 MB
+        '-t','25',           // a little shorter is fine for detection
+        '-ac','1',           // mono
+        '-ar','16000',       // 16 kHz
+        '-c:a','libopus',    // Opus is very efficient
+        '-b:a', `${brKbps}k`,
+        '-vbr','on',
         proxy
       ];
-      const cmd = `ffmpeg ${proxyArgs.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
-      exec(cmd, (e,_so,se)=> e?reject(se):resolve());
+      const cmd = `ffmpeg ${args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')}`;
+      exec(cmd, (e, _so, se) => e ? reject(se) : resolve());
     });
 
+    // Try 32k, then 24k, then 16k until size < 3 MB
+    const targets = [32, 24, 16];
+    let made = false;
+    for (const kb of targets) {
+      await mkProxy(kb);
+      try {
+        const sz = fs.statSync(proxy).size;
+        if (sz <= 3_000_000) { made = true; break; }
+      } catch { /* ignore and fall through */ }
+      try { if (proxy && fs.existsSync(proxy)) fs.unlinkSync(proxy); } catch(_){}
+    }
+    if (!made) {
+      // last try at 12k if still too big
+      await mkProxy(12);
+    }
+  
     const account = process.env.CF_ACCOUNT_ID || '';
     const token   = process.env.CF_API_TOKEN  || '';
     if(!account || !token) return res.status(500).json({ error:'cloudflare_credentials_missing' });
@@ -64,7 +83,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     const fd = new FormData();
     fd.append('input', JSON.stringify(input));
     // Use Blob from undici (Node 18+)
-    fd.append('file', new Blob([buf], { type: 'application/octet-stream' }), path.basename(req.file.originalname || 'audio'));
+    fd.append('file', new Blob([buf], { type: 'audio/ogg' }), path.basename(proxy));
 
     const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/openai/whisper`;
     const cf = await fetch(url, { method:'POST', headers:{ Authorization: `Bearer ${token}` }, body: fd });
