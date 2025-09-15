@@ -333,7 +333,9 @@
 
   <script>
   // === FWEA-I Omnilingual Clean Version Editor (MVP) ===
-  const DEFAULT_API = 'https://clean.fwea-i.com'; // HTTPS reverse-proxy to Hetzner backend (via Caddy)
+  const qp = new URLSearchParams(location.search);
+  const DEFAULT_API = qp.get('api') || 'https://clean.fwea-i.com'; // allow override via ?api=
+  // example: https://fwea-i.com/omni-clean?api=https://clean.fwea-i.com
   const BACKEND_BASE = (location.hostname==='localhost' || location.hostname==='127.0.0.1') ? 'http://localhost:8000' : DEFAULT_API;
   const STRIPE_BUY_LINK = 'https://buy.stripe.com/6oU8wQ3jrdqz3A63zCfbq0e';
 
