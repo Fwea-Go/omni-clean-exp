@@ -33,16 +33,34 @@ app.get('/', (_req,res)=> res.json({ ok:true, msg:'FWEA-I Clean Editor API (Node
 
 // POST /preview  -> returns { preview_url, language, transcript, muted_spans }
 app.post('/preview', upload.single('file'), async (req, res) => {
+  let proxy;
   try{
     if(!req.file) return res.status(400).json({ error:'missing_file' });
     const src = req.file.path;
+
+    // Create a small 30s proxy for Whisper (Free tier has ~4MB upload cap)
+    proxy = path.join('uploads', `${Date.now().toString(36)}_proxy.mp3`);
+    await new Promise((resolve,reject)=>{
+      const proxyArgs = [
+        '-hide_banner','-loglevel','error','-y',
+        '-i', src,
+        '-t','30',        // limit duration
+        '-ac','1',        // mono
+        '-ar','16000',    // 16 kHz
+        '-b:a','48k',     // 48 kbps keeps most clips <4 MB
+        proxy
+      ];
+      const cmd = `ffmpeg ${proxyArgs.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
+      exec(cmd, (e,_so,se)=> e?reject(se):resolve());
+    });
+
     const account = process.env.CF_ACCOUNT_ID || '';
     const token   = process.env.CF_API_TOKEN  || '';
     if(!account || !token) return res.status(500).json({ error:'cloudflare_credentials_missing' });
 
     // Cloudflare Whisper call (verbose JSON)
     const input = { response_format: 'verbose_json' };
-    const buf = fs.readFileSync(src);
+    const buf = fs.readFileSync(proxy);
     const fd = new FormData();
     fd.append('input', JSON.stringify(input));
     // Use Blob from undici (Node 18+)
@@ -51,7 +69,10 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/openai/whisper`;
     const cf = await fetch(url, { method:'POST', headers:{ Authorization: `Bearer ${token}` }, body: fd });
     const j = await cf.json();
-    if(!cf.ok) return res.status(502).json({ error:'whisper_failed', detail:j });
+    if (!cf.ok) {
+      console.error('Whisper failed:', cf.status, j);
+      return res.status(502).json({ error: 'whisper_failed', detail: j });
+    }
 
     const result = j.result || j;
     const transcript = result.text || '';
@@ -72,7 +93,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     const out = path.join('public', `${id}.mp3`);
     const filter = merged.map(s=>`volume=enable='between(t,${Math.max(0,s.start).toFixed(3)},${Math.max(0,s.end).toFixed(3)})':volume=0`).join(',');
 
-    const args = ['-hide_banner','-loglevel','error','-y','-i', src, '-t','30'];
+    const args = ['-hide_banner','-loglevel','error','-y','-i', proxy, '-t','30'];
     if (filter) args.push('-af', filter);
     args.push('-codec:a','libmp3lame','-b:a','192k', out);
 
@@ -92,6 +113,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     res.status(500).json({ error:'preview_failed', detail:String(err) });
   }finally{
     try{ if(req.file?.path) fs.unlink(req.file.path, ()=>{}); }catch(_){ }
+    try{ if(proxy && fs.existsSync(proxy)) fs.unlink(proxy, ()=>{}); }catch(_){ }
   }
 });
 
