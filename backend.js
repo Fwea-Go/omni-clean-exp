@@ -6,7 +6,24 @@ const multer = require('multer');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+
 const { exec } = require('child_process');
+// tiny promise-wrapped exec
+const sh = (cmd) => new Promise((resolve, reject)=>{
+  exec(cmd, (e, so, se)=> e ? reject(se || e) : resolve(so));
+});
+
+// read track duration with ffprobe (seconds as Number)
+async function ffprobeDuration(src){
+  try{
+    const cmd = `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 ${src.includes(' ') ? '"'+src+'"' : src}`;
+    const out = await sh(cmd);
+    const n = parseFloat(String(out).trim());
+    return Number.isFinite(n) ? n : 0;
+  }catch{
+    return 0;
+  }
+}
 
 const app = express();
 const port = process.env.PORT || 8000;
@@ -33,127 +50,116 @@ app.get('/', (_req,res)=> res.json({ ok:true, msg:'FWEA-I Clean Editor API (Node
 
 // POST /preview  -> returns { preview_url, language, transcript, muted_spans }
 app.post('/preview', upload.single('file'), async (req, res) => {
-  let proxy;
+  let tmpFiles = [];
   try{
     if(!req.file) return res.status(400).json({ error:'missing_file' });
     const src = req.file.path;
-
-    // --- Make a tiny Opus proxy for Whisper (hard cap ≤ ~2.6 MB) ---
-    // Strategy: aggressively downsample + trim; try a few profiles.
-    const mkProxy = (brKbps, seconds) => new Promise((resolve, reject) => {
-      proxy = path.join('uploads', `${Date.now().toString(36)}_proxy.ogg`);
-      const args = [
-        '-hide_banner','-loglevel','error','-y',
-        '-i', src,
-        '-t', String(seconds),   // trim to N seconds for preview/transcription
-        '-ac','1',               // mono
-        '-ar','16000',           // 16 kHz
-        '-c:a','libopus',        // very efficient + widely supported
-        '-application','voip',   // prioritize speech
-        '-compression_level','10',
-        '-b:a', `${brKbps}k`,
-        '-vbr','on',
-        proxy
-      ];
-      const cmd = `ffmpeg ${args.map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ')}`;
-      exec(cmd, (e, _so, se) => e ? reject(se) : resolve());
-    });
-
-    // Try progressively smaller profiles until size ≤ 2.6 MB
-    // (Cloudflare rejects larger request bodies on this endpoint.)
-    const profiles = [
-      { br: 14, t: 25 },
-      { br: 12, t: 25 },
-      { br: 10, t: 22 },
-      { br:  8, t: 20 },
-      { br:  8, t: 18 },
-    ];
-    let okProxy = false;
-    for (const p of profiles) {
-      // delete any prior attempt
-      try { if (proxy && fs.existsSync(proxy)) fs.unlinkSync(proxy); } catch {}
-      await mkProxy(p.br, p.t);
-      try {
-        const bytes = fs.statSync(proxy).size;
-        if (bytes <= 2_600_000) { okProxy = true; break; }
-      } catch { /* keep trying */ }
-    }
-    if (!okProxy) {
-      // Final guard: re-open at the smallest profile again
-      try { if (proxy && fs.existsSync(proxy)) fs.unlinkSync(proxy); } catch {}
-      await mkProxy(8, 18);
-    }
-
-    // Load proxy data and bail out if still too large
-    let buf = Buffer.alloc(0);
-    try { buf = fs.readFileSync(proxy); } catch {}
-    if (!buf.length || buf.length > 2_600_000) {
-      return res.status(413).json({
-        error: 'proxy_too_large',
-        detail: { size_bytes: buf.length || 0, hint: 'Please try a shorter clip (≤20s) or lower quality source.' }
-      });
-    }
 
     const account = process.env.CF_ACCOUNT_ID || '';
     const token   = process.env.CF_API_TOKEN  || '';
     if(!account || !token) return res.status(500).json({ error:'cloudflare_credentials_missing' });
 
-    // Cloudflare Whisper call (verbose JSON)
-    const input = { response_format: 'verbose_json' };
-    const buf = fs.readFileSync(proxy);
-    const fd = new FormData();
-    fd.append('input', JSON.stringify(input));
-    // Use Blob from undici (Node 18+)
-    fd.append('file', new Blob([buf], { type: 'audio/ogg' }), path.basename(proxy));
+    // --- Work out duration & chunk plan ---
+    const dur = await ffprobeDuration(src); // seconds
+    const CHUNK_SEC = 22;     // sized to keep request body small
+    const CHUNK_BR  = 10;     // kbps Opus target (~ < 2.6MB per slice)
 
-    const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/openai/whisper`;
-    const cf = await fetch(url, { method:'POST', headers:{ Authorization: `Bearer ${token}` }, body: fd });
-    const j = await cf.json();
-    if (!cf.ok) {
-      console.error('Whisper failed:', cf.status, j);
-      return res.status(502).json({ error: 'whisper_failed', detail: j });
+    // function to build a tiny Opus slice for [start, start+len]
+    async function makeSlice(start, len){
+      const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.ogg`);
+      const args = [
+        '-hide_banner','-loglevel','error','-y',
+        '-ss', String(Math.max(0, start)),
+        '-t',  String(Math.max(0.1, len)),
+        '-i',  src,
+        '-ac','1','-ar','16000',
+        '-c:a','libopus','-application','voip','-compression_level','10','-b:a', `${CHUNK_BR}k`,'-vbr','on',
+        out
+      ];
+      const cmd = `ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
+      await sh(cmd);
+      tmpFiles.push(out);
+      return out;
     }
 
-    const result = j.result || j;
-    const transcript = result.text || '';
-    const segs = Array.isArray(result.segments) ? result.segments : [];
-    const language = result.language || 'auto';
+    // Send a buffer to Cloudflare Whisper and return JSON
+    async function whisperFile(filepath){
+      const buf = fs.readFileSync(filepath);
+      const fd = new FormData();
+      fd.append('input', JSON.stringify({ response_format:'verbose_json' }));
+      fd.append('file', new Blob([buf], { type: 'audio/ogg' }), path.basename(filepath));
+      const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/openai/whisper`;
+      const cf  = await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${token}` }, body: fd });
+      const j   = await cf.json().catch(()=>({}));
+      if(!cf.ok){
+        return { ok:false, error:{ status: cf.status, body: j } };
+      }
+      return { ok:true, json: j };
+    }
 
-    // Build spans where a segment contains profanity
+    // --- Chunk, transcribe, offset segments ---
+    const segments = []; // full-song
+    let language = 'auto';
+    const total = Math.max(0, dur) || CHUNK_SEC; // if ffprobe failed, do at least one chunk
+
+    for(let start=0; start < total; start += CHUNK_SEC){
+      const len = Math.min(CHUNK_SEC, total - start);
+      const slice = await makeSlice(start, len);
+      const r = await whisperFile(slice);
+      if(!r.ok){
+        // if the first chunk fails due to size, bail early with helpful error
+        return res.status(502).json({ error:'whisper_failed', detail:r.error });
+      }
+      const result = r.json.result || r.json;
+      if(result.language) language = result.language;
+      const segs = Array.isArray(result.segments) ? result.segments : [];
+      for(const s of segs){
+        const st = Number(s.start)||0, en = Number(s.end)||0;
+        segments.push({ start: st + start, end: en + start, text: s.text||'' });
+      }
+    }
+
+    // --- Build profanity spans across the entire song ---
     const spans = [];
-    for(const s of segs){
-      const txt = s.text || '';
-      if(hasBad(txt)) spans.push({ start: Number(s.start)||0, end: Number(s.end)||0, reason:'profanity' });
+    for(const s of segments){ if(hasBad(s.text)) spans.push({ start: Math.max(0,s.start), end: Math.max(0,s.end), reason:'profanity' }); }
+    spans.sort((a,b)=> a.start-b.start);
+    const merged = [];
+    for(const s of spans){
+      if(!merged.length || s.start > merged[merged.length-1].end){ merged.push({...s}); }
+      else { merged[merged.length-1].end = Math.max(merged[merged.length-1].end, s.end); }
     }
-    spans.sort((a,b)=>a.start-b.start);
-    const merged=[]; for(const s of spans){ if(!merged.length||s.start>merged[merged.length-1].end) merged.push({...s}); else merged[merged.length-1].end=Math.max(merged[merged.length-1].end,s.end); }
 
-    // FFmpeg: apply mutes and trim to 30s
+    // --- Render 30s preview from the ORIGINAL upload ---
     const id = Date.now().toString(36);
     const out = path.join('public', `${id}.mp3`);
-    const filter = merged.map(s=>`volume=enable='between(t,${Math.max(0,s.start).toFixed(3)},${Math.max(0,s.end).toFixed(3)})':volume=0`).join(',');
 
-    const args = ['-hide_banner','-loglevel','error','-y','-i', proxy, '-t','30'];
-    if (filter) args.push('-af', filter);
+    // Only mute spans that intersect 0–30s window
+    const PREVIEW_T = 30;
+    const toMute = merged
+      .filter(s => s.end > 0 && s.start < PREVIEW_T)
+      .map(s => ({ start: Math.max(0,s.start), end: Math.min(PREVIEW_T, s.end) }))
+      .filter(s => s.end > s.start);
+    const filter = toMute.map(s=>`volume=enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})':volume=0`).join(',');
+
+    const args = ['-hide_banner','-loglevel','error','-y','-i', src, '-t', String(PREVIEW_T)];
+    if(filter) args.push('-af', filter);
     args.push('-codec:a','libmp3lame','-b:a','192k', out);
+    await sh(`ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`);
 
-    await new Promise((resolve,reject)=>{
-      const cmd = `ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
-      exec(cmd, (e,_so,se)=> e?reject(se):resolve());
-    });
-
-    res.json({
+    return res.json({
       preview_url: `/public/${path.basename(out)}`,
       language,
-      transcript,
+      transcript: segments.map(s=>s.text||'').join(' ').trim(),
       muted_spans: merged,
     });
   }catch(err){
     console.error(err);
     res.status(500).json({ error:'preview_failed', detail:String(err) });
   }finally{
+    // cleanup
     try{ if(req.file?.path) fs.unlink(req.file.path, ()=>{}); }catch(_){ }
-    try{ if(proxy && fs.existsSync(proxy)) fs.unlink(proxy, ()=>{}); }catch(_){ }
+    for(const f of tmpFiles){ try{ fs.unlink(f, ()=>{}); }catch(_){ }
+    }
   }
 });
 
