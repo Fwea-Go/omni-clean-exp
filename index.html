@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>FWEA-I | Omnilingual Clean Version Editor</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet" />
+
+  <style>
+    :root{--wf-h-lg:120px;--wf-h-sm:84px}
+    body{background:linear-gradient(135deg,#232526 0%,#414345 100%);min-height:100vh;font-family:'Segoe UI',sans-serif;color:#fff}
+    .player-boundary{background:rgba(44,44,54,.97);border-radius:2rem;box-shadow:0 8px 32px 0 rgba(31,38,135,.27);border:3px solid #00ffaa;max-width:1200px;margin:3rem auto;padding:3.5rem 2rem;position:relative}
+    .app-header { text-align:center; margin-bottom: 20px; }
+    .app-header h1{
+      font-size:clamp(1.5rem,4vw,2.5rem);font-weight:bold;
+      background:linear-gradient(90deg,#00ffcc,#00ffaa);
+      -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+      text-shadow:0 0 10px rgba(0,255,204,.6),0 0 20px rgba(0,255,170,.4);
+      letter-spacing:2px;
+    }
+
+    /* Cards + controls (same neon vibe) */
+    .card{background:#2d2d35;border-radius:1.25rem;padding:1.25rem;border:1px solid rgba(255,255,255,.06);box-shadow:0 10px 24px rgba(0,0,0,.25)}
+    .dropzone{border:2px dashed #00ffaa88;border-radius:1.5rem;background:rgba(0,0,0,.15);padding:2rem;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.75rem;text-align:center}
+    .dropzone.highlight{background:rgba(0,255,170,.08);box-shadow:0 0 24px rgba(0,255,170,.25) inset}
+    .dz-title{font-size:1.25rem;color:#00ffaa;letter-spacing:1px}
+    .dz-sub{color:#a8a8b8;font-size:.95rem}
+    .pill{display:inline-block;padding:.25rem .6rem;border-radius:999px;background:rgba(255,255,255,.08);font-size:.85rem}
+    .status{font-family:monospace;color:#cfe}
+    .actions-row{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center}
+    .btn{border:2px solid currentColor;border-radius:1rem;padding:.75rem 1rem;font-weight:700;box-shadow:0 0 12px 2px currentColor,0 0 24px 6px currentColor;background:transparent;transition:transform .2s}
+    .btn:hover{transform:scale(1.03);background:currentColor;color:#23232a}
+    .btn-primary{color:#00ffaa}
+    .btn-alt{color:#06b6d4}
+    .hidden{display:none!important}
+    .small{font-size:.9rem}
+  </style>
+</head>
+<body>
+  <div class="player-boundary">
+    <header class="app-header">
+      <h1>FWEA-I OMNILINGUAL CLEAN VERSION EDITOR</h1>
+    </header>
+
+    <!-- Clean Editor Main -->
+    <section id="clean-editor" class="grid grid-cols-1 gap-6">
+      <!-- Upload / Drop -->
+      <div id="uploader" class="card">
+        <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Upload or drop audio">
+          <div class="dz-title">Drop audio here or click to upload</div>
+          <div class="dz-sub">MP3, WAV, M4A, AAC, FLAC · Free 30s censored preview · Full clean via Stripe</div>
+          <input id="file-input" type="file" accept="audio/*" class="hidden" />
+        </div>
+        <div class="mt-3 actions-row">
+          <span id="sel-file" class="pill">No file selected</span>
+          <span id="file-size" class="pill hidden"></span>
+          <span id="lang-pill" class="pill hidden"></span>
+        </div>
+        <div id="status" class="status mt-3">Idle.</div>
+      </div>
+
+      <!-- Preview Card -->
+      <div id="preview-card" class="card hidden">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-xl font-bold" style="color:#00ffaa">Censored Preview (30s)</h3>
+          <span id="detected-lang" class="pill"></span>
+        </div>
+        <audio id="preview-audio" controls preload="metadata" style="width:100%"></audio>
+        <div class="mt-3 actions-row">
+          <button id="download-preview" class="btn btn-alt small hidden">Download preview</button>
+          <a id="buy-full" href="https://buy.stripe.com/6oU8wQ3jrdqz3A63zCfbq0e" target="_blank" rel="noopener" class="btn btn-primary">Unlock Full Clean on Stripe →</a>
+        </div>
+        <details class="mt-3">
+          <summary class="cursor-pointer">Show transcript & muted spans</summary>
+          <pre id="transcript" style="white-space:pre-wrap"></pre>
+        </details>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    // ===== CONFIG =====
+    // Point this at your Hetzner API once you deploy the backend below:
+    const BACKEND_BASE = 'http://YOUR-HETZNER-IP:8000'; // e.g. http://178.156.190.229:8000 (switch to https when you add a cert)
+
+    const STRIPE_BUY_LINK = 'https://buy.stripe.com/6oU8wQ3jrdqz3A63zCfbq0e';
+
+    // ===== UI HOOKS =====
+    const els = {
+      dropzone: document.getElementById('dropzone'),
+      fileInput: document.getElementById('file-input'),
+      selFile: document.getElementById('sel-file'),
+      fileSize: document.getElementById('file-size'),
+      langPill: document.getElementById('lang-pill'),
+      status: document.getElementById('status'),
+      previewCard: document.getElementById('preview-card'),
+      previewAudio: document.getElementById('preview-audio'),
+      downloadPreview: document.getElementById('download-preview'),
+      detectedLang: document.getElementById('detected-lang'),
+      transcript: document.getElementById('transcript'),
+      buyFull: document.getElementById('buy-full'),
+    };
+
+    els.buyFull.href = STRIPE_BUY_LINK;
+
+    function fmtBytes(bytes){
+      if (!bytes && bytes !== 0) return '';
+      const units = ['B','KB','MB','GB'];
+      let i=0,val=bytes; while(val>=1024 && i<units.length-1){ val/=1024; i++; }
+      return `${val.toFixed(val>=10?0:1)} ${units[i]}`;
+    }
+    function setStatus(msg){ els.status.textContent = msg; }
+    function setFileMeta(file){
+      els.selFile.textContent = file ? file.name : 'No file selected';
+      if (file){ els.fileSize.classList.remove('hidden'); els.fileSize.textContent = fmtBytes(file.size); }
+      else { els.fileSize.classList.add('hidden'); }
+    }
+
+    // ===== DRAG & DROP =====
+    function openPicker(){ els.fileInput.click(); }
+    els.dropzone.addEventListener('click', openPicker);
+    els.dropzone.addEventListener('keydown', (e)=>{ if(e.key==='Enter'||e.key===' '||e.key==='Spacebar') openPicker(); });
+    ['dragenter','dragover'].forEach(ev=>{
+      els.dropzone.addEventListener(ev, (e)=>{ e.preventDefault(); e.stopPropagation(); els.dropzone.classList.add('highlight'); });
+    });
+    ['dragleave','drop'].forEach(ev=>{
+      els.dropzone.addEventListener(ev, (e)=>{ e.preventDefault(); e.stopPropagation(); els.dropzone.classList.remove('highlight'); });
+    });
+    els.dropzone.addEventListener('drop', (e)=>{
+      const file = e.dataTransfer?.files?.[0]; if(!file) return; handleFile(file);
+    });
+    els.fileInput.addEventListener('change', ()=>{ const f = els.fileInput.files[0]; if(f) handleFile(f); });
+
+    async function handleFile(file){
+      if (!/audio\\//.test(file.type) && !/\\.(mp3|wav|m4a|aac|flac)$/i.test(file.name)){
+        setStatus('Unsupported file. Use MP3, WAV, M4A, AAC, or FLAC.'); return;
+      }
+      setFileMeta(file);
+      setStatus('Processing: speech-to-text → detect profanity → mute → 30s preview…');
+      if (!BACKEND_BASE){
+        setStatus('Set BACKEND_BASE in the script to your Hetzner API.');
+        return;
+      }
+      const fd = new FormData();
+      fd.append('file', file);
+      try{
+        const res = await fetch(`${BACKEND_BASE.replace(/\\/$/,'')}/preview`, { method:'POST', body: fd });
+        if(!res.ok){ setStatus('Backend error '+res.status); return; }
+        const data = await res.json();
+        showPreview(data);
+        setStatus('Ready.');
+      }catch(err){
+        console.error(err);
+        setStatus('Network error. Check CORS / URL.');
+      }
+    }
+
+    function showPreview(data){
+      const { preview_url, language, transcript, muted_spans } = data || {};
+      if (language){ els.detectedLang.textContent = `Lang: ${language}`; els.detectedLang.classList.remove('hidden'); els.langPill.textContent = `Lang: ${language}`; els.langPill.classList.remove('hidden'); }
+      if (transcript){
+        let txt = transcript;
+        if (Array.isArray(muted_spans) && muted_spans.length){
+          txt += '\\n\\nMuted sections (s):\\n';
+          muted_spans.forEach((s,i)=>{ txt += ` ${i+1}. ${s.start.toFixed(2)}–${s.end.toFixed(2)} (${s.reason||'profanity'})\\n`; });
+        }
+        els.transcript.textContent = txt;
+      }
+      if (preview_url){ els.previewAudio.src = `${BACKEND_BASE.replace(/\\/$/,'')}${preview_url}`; els.downloadPreview.classList.remove('hidden'); els.downloadPreview.onclick=()=>{ const a=document.createElement('a'); a.href=els.previewAudio.src; a.download='preview_censored.mp3'; document.body.appendChild(a); a.click(); a.remove(); }; }
+      els.previewCard.classList.remove('hidden');
+    }
+
+    // Space toggles preview audio
+    document.addEventListener('keydown', (e)=>{
+      if(e.code==='Space' && !e.repeat){
+        const tag=(e.target?.tagName||'').toLowerCase(); if(tag==='input'||tag==='textarea')return;
+        e.preventDefault(); const a=els.previewAudio; if(!a||!a.src) return; if(a.paused) a.play().catch(()=>{}); else a.pause();
+      }
+    });
+
+    setStatus('Idle. Drop an audio file to begin.');
+  </script>
+</body>
+</html>
