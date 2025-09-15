@@ -61,8 +61,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
 
     // --- Work out duration & chunk plan ---
     const dur = await ffprobeDuration(src); // seconds
-    const CHUNK_SEC = 22;     // sized to keep request body small
-    const CHUNK_BR  = 10;     // kbps Opus target (~ < 2.6MB per slice)
+    const CHUNK_SEC = 8;      // smaller WAV slices to stay well under CF body cap
 
     // function to build a tiny WAV slice for [start, start+len]
     async function makeSlice(start, len){
@@ -72,15 +71,14 @@ app.post('/preview', upload.single('file'), async (req, res) => {
         '-ss', String(Math.max(0, start)),
         '-t',  String(Math.max(0.1, len)),
         '-i',  src,
-        // robust, CF‑friendly speech format
-        '-ac','1',          // mono
-        '-ar','16000',      // 16 kHz
-        '-c:a','pcm_s16le', // 16‑bit linear PCM
+        // robust, CF‑friendly speech format: 16‑bit PCM mono 16 kHz
+        '-ac','1',
+        '-ar','16000',
+        '-c:a','pcm_s16le',
         out
       ];
       const cmd = `ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
       await sh(cmd);
-      // sanity check to avoid sending empty/zero slices
       const st = fs.statSync(out);
       if (!st.size || st.size < 1024) throw new Error(`slice_too_small: ${out} (${st.size} bytes)`);
       tmpFiles.push(out);
