@@ -64,20 +64,25 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     const CHUNK_SEC = 22;     // sized to keep request body small
     const CHUNK_BR  = 10;     // kbps Opus target (~ < 2.6MB per slice)
 
-    // function to build a tiny Opus slice for [start, start+len]
+    // function to build a tiny WAV slice for [start, start+len]
     async function makeSlice(start, len){
-      const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.ogg`);
+      const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.wav`);
       const args = [
         '-hide_banner','-loglevel','error','-y',
         '-ss', String(Math.max(0, start)),
         '-t',  String(Math.max(0.1, len)),
         '-i',  src,
-        '-ac','1','-ar','16000',
-        '-c:a','libopus','-application','voip','-compression_level','10','-b:a', `${CHUNK_BR}k`,'-vbr','on',
+        // robust, CF‑friendly speech format
+        '-ac','1',          // mono
+        '-ar','16000',      // 16 kHz
+        '-c:a','pcm_s16le', // 16‑bit linear PCM
         out
       ];
       const cmd = `ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
       await sh(cmd);
+      // sanity check to avoid sending empty/zero slices
+      const st = fs.statSync(out);
+      if (!st.size || st.size < 1024) throw new Error(`slice_too_small: ${out} (${st.size} bytes)`);
       tmpFiles.push(out);
       return out;
     }
@@ -87,7 +92,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       const buf = fs.readFileSync(filepath);
       const fd = new FormData();
       fd.append('input', JSON.stringify({ response_format:'verbose_json' }));
-      fd.append('file', new Blob([buf], { type: 'audio/ogg' }), path.basename(filepath));
+      fd.append('file', new Blob([buf], { type: 'audio/wav' }), path.basename(filepath));
       const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/openai/whisper`;
       const cf  = await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${token}` }, body: fd });
       const j   = await cf.json().catch(()=>({}));
