@@ -61,7 +61,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
 
     // --- Work out duration & chunk plan ---
     const dur = await ffprobeDuration(src); // seconds
-    const CHUNK_SEC = 8;      // smaller WAV slices to stay well under CF body cap
+    const CHUNK_SEC = 6;      // smaller WAV slices to stay well under CF body cap
 
     // function to build a tiny WAV slice for [start, start+len]
     async function makeSlice(start, len){
@@ -79,7 +79,10 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       ];
       const cmd = `ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
       await sh(cmd);
-      const st = fs.statSync(out);
+      // debug: log slice size that we are about to upload
+      let st;
+      try { st = fs.statSync(out); } catch(e){ st = { size: 0 }; }
+      console.log(`[slice] ${path.basename(out)} len=${len.toFixed(3)}s size=${(st.size/1024).toFixed(1)}KB`);
       if (!st.size || st.size < 1024) throw new Error(`slice_too_small: ${out} (${st.size} bytes)`);
       tmpFiles.push(out);
       return out;
@@ -88,6 +91,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     // Send a buffer to Cloudflare Whisper and return JSON
     async function whisperFile(filepath){
       const buf = fs.readFileSync(filepath);
+      console.log(`[upload] ${path.basename(filepath)} bytes=${buf.length}`);
       const fd = new FormData();
       fd.append('input', JSON.stringify({ response_format:'verbose_json' }));
       fd.append('file', new Blob([buf], { type: 'audio/wav' }), path.basename(filepath));
@@ -95,7 +99,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       const cf  = await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${token}` }, body: fd });
       const j   = await cf.json().catch(()=>({}));
       if(!cf.ok){
-        return { ok:false, error:{ status: cf.status, body: j } };
+        return { ok:false, error:{ status: cf.status, body: j, file: path.basename(filepath), bytes: buf.length } };
       }
       return { ok:true, json: j };
     }
@@ -111,7 +115,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       const r = await whisperFile(slice);
       if(!r.ok){
         // if the first chunk fails due to size, bail early with helpful error
-        return res.status(502).json({ error:'whisper_failed', detail:r.error });
+        return res.status(502).json({ error:'whisper_failed', detail:r.error, chunk: { start, len } });
       }
       const result = r.json.result || r.json;
       if(result.language) language = result.language;
