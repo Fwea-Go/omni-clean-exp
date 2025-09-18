@@ -14,15 +14,15 @@ WHISPER_MODEL = "@cf/openai/whisper"
 # Basic multilingual profanity list (starter; expand as needed)
 BAD_WORDS = [
     # English
-    r"\\b(fuck|shit|bitch|asshole|cunt|motherfucker|dick|pussy|nigga|nigger|hoe|slut)\\b",
+    r"\b(fuck|shit|bitch|asshole|cunt|motherfucker|dick|pussy|nigga|nigger|hoe|slut)\b",
     # Spanish
-    r"\\b(puta|puto|pendejo|mierda|cabron|coño)\\b",
+    r"\b(puta|puto|pendejo|mierda|cabron|coño)\b",
     # French
-    r"\\b(putain|merde|salope|con)\\b",
+    r"\b(putain|merde|salope|con)\b",
     # Haitian Creole (starter)
-    r"\\b(bitch|koko|vagin|kaka|manmanw|manman’w)\\b",
+    r"\b(bitch|koko|vagin|kaka|manmanw|manman’w)\b",
     # Portuguese
-    r"\\b(merda|caralho|porra|puta)\\b",
+    r"\b(merda|caralho|porra|puta)\b",
     # …add more langs/variants
 ]
 BAD_RE = re.compile("|".join(BAD_WORDS), flags=re.IGNORECASE)
@@ -43,100 +43,147 @@ def run(cmd):
         raise RuntimeError(p.stderr)
     return p.stdout
 
-def whisper_transcribe(file_path):
-    # Cloudflare AI /workers-ai endpoint
+# --- FFmpeg/ffprobe helpers ---
+def ffprobe_duration(src_path: str) -> float:
+    try:
+        out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", src_path])
+        return float(out.strip())
+    except Exception:
+        return 0.0
+
+def make_slice(src_path: str, start: float, length: float) -> str:
+    # Produce a tiny 16kHz mono PCM WAV slice for Cloudflare
+    fd, tmpwav = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{max(0.0, start)}",
+        "-t", f"{max(0.1, length)}",
+        "-i", src_path,
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        tmpwav,
+    ]
+    run(cmd)
+    # sanity: ensure slice is at least ~1KB (prevents empty uploads)
+    if os.path.getsize(tmpwav) < 1024:
+        raise RuntimeError(f"slice_too_small: {tmpwav}")
+    return tmpwav
+
+# Cloudflare Whisper call for a local file path
+def whisper_file(filepath: str) -> dict:
     if not (CF_ACCOUNT_ID and CF_API_TOKEN):
         raise RuntimeError("Missing CF_ACCOUNT_ID / CF_API_TOKEN")
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{WHISPER_MODEL}"
-    with open(file_path, "rb") as f:
-        files = {"file": ("audio", f, "application/octet-stream")}
-        # You can pass options; word timestamps may not be available – we fall back to segment timing
-        data = {"response_format": "verbose_json"}
-        headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
-        r = requests.post(url, headers=headers, data={"input": json.dumps(data)}, files=files, timeout=600)
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
+    # response_format=verbose_json for segments with start/end
+    data = {"input": json.dumps({"response_format": "verbose_json"})}
+    with open(filepath, "rb") as f:
+        files = {"file": (os.path.basename(filepath), f, "audio/wav")}
+        r = requests.post(url, headers=headers, data=data, files=files, timeout=600)
     if not r.ok:
         raise RuntimeError(f"Cloudflare AI error: {r.status_code} {r.text}")
-    return r.json()  # expected: {"result": {"text": "...", "segments":[{"text": "...","start":0.0,"end":2.4}, ...] }}
+    return r.json()  # {"result": {"segments":[...], "language":".." }}
 
-def find_profane_spans(transcript_json):
-    res = transcript_json.get("result") or transcript_json
-    text = res.get("text","") or ""
-    segments = res.get("segments") or []  # start/end per chunk
-    spans = []
-    for seg in segments:
-        seg_text = seg.get("text","") or ""
-        if BAD_RE.search(seg_text):
-            spans.append({
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "reason": "profanity"
-            })
-    # Merge overlaps
-    spans.sort(key=lambda s: s["start"])
-    merged = []
-    for s in spans:
-        if not merged or s["start"] > merged[-1]["end"]:
-            merged.append(s)
-        else:
-            merged[-1]["end"] = max(merged[-1]["end"], s["end"])
-    # Clamp negatives, etc.
-    for s in merged:
-        if s["end"] < s["start"]:
-            s["end"] = s["start"]
-    # Best-effort language guess (very rough – improve later)
-    language = res.get("language") or "auto"
-    return text, language, merged
 
-def build_ffmpeg_mute_filter(spans):
-    # volume=0 between each span; chain with , to apply sequentially
-    # We also lowpass a tiny click-fade via afade at boundaries
-    filters = []
-    for s in spans:
-        start = max(0.0, float(s["start"]))
-        end   = max(0.0, float(s["end"]))
-        if end <= start: continue
-        filters.append(f"volume=enable='between(t,{start:.3f},{end:.3f})':volume=0")
-    if not filters:
-        return None
-    return ",".join(filters)
+
 
 @app.post("/preview")
 async def preview(file: UploadFile = File(...)):
-    # Save upload
+    # Save upload to temp
     suffix = os.path.splitext(file.filename or "audio")[1] or ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(await file.read()); tmp.flush(); tmp.close()
     src = tmp.name
 
-    # Transcribe via Cloudflare AI (multilingual)
+    slices = []
     try:
-        tr = whisper_transcribe(src)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"transcribe_failed: {str(e)}"})
+        # --- Plan chunking ---
+        dur = ffprobe_duration(src) or 0.0
+        CHUNK_SEC = 6.0
+        total = dur if dur > 0 else CHUNK_SEC
 
-    transcript, language, spans = find_profane_spans(tr)
+        # --- Transcribe per-slice and accumulate segments ---
+        full_segments = []
+        language = "auto"
+        t = 0.0
+        while t < total - 1e-6:
+            length = CHUNK_SEC if (t + CHUNK_SEC) <= total else (total - t)
+            wav = make_slice(src, t, length)
+            slices.append(wav)
+            try:
+                r = whisper_file(wav)
+            except Exception as e:
+                # surface CF specific body-too-large style errors
+                return JSONResponse(status_code=502, content={"error": "whisper_failed", "detail": str(e), "chunk": {"start": t, "len": length}})
+            result = r.get("result") or r
+            if result.get("language"):
+                language = result["language"]
+            segs = result.get("segments") or []
+            for s in segs:
+                st = float(s.get("start", 0.0)) + t
+                en = float(s.get("end", 0.0)) + t
+                full_segments.append({"start": st, "end": en, "text": s.get("text", "")})
+            t += CHUNK_SEC
 
-    # Build FFmpeg filter
-    mute_filter = build_ffmpeg_mute_filter(spans)
-    out_id = str(uuid.uuid4()).replace("-","")
-    out_path = os.path.join("public", f"{out_id}.mp3")
+        # --- Profanity spans based on segments ---
+        transcript_text = " ".join((s.get("text") or "").strip() for s in full_segments).strip()
+        spans = []
+        for s in full_segments:
+            if BAD_RE.search(s.get("text", "")):
+                spans.append({"start": max(0.0, s["start"]), "end": max(0.0, s["end"]), "reason": "profanity"})
+        spans.sort(key=lambda x: x["start"]) 
+        merged = []
+        for s in spans:
+            if not merged or s["start"] > merged[-1]["end"]:
+                merged.append(dict(s))
+            else:
+                merged[-1]["end"] = max(merged[-1]["end"], s["end"])
 
-    # FFmpeg command: trim to 30s preview, apply mutes, encode MP3
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-i", src,
-           "-t", "30"]
-    if mute_filter:
-        cmd += ["-af", mute_filter]
-    cmd += ["-codec:a", "libmp3lame", "-b:a", "192k", out_path]
-    try:
-        run(cmd)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"ffmpeg_failed: {str(e)}"})
+        # --- Render 30s preview from original upload with mutes intersecting [0,30] ---
+        PREVIEW_T = 30.0
+        to_mute = []
+        for s in merged:
+            if s["end"] > 0 and s["start"] < PREVIEW_T:
+                to_mute.append({
+                    "start": max(0.0, s["start"]),
+                    "end": min(PREVIEW_T, s["end"]),
+                })
+        # Build ffmpeg -af filter
+        filters = []
+        for s in to_mute:
+            if s["end"] > s["start"]:
+                filters.append(f"volume=enable='between(t,{s['start']:.3f},{s['end']:.3f})':volume=0")
+        mute_filter = ",".join(filters) if filters else None
 
-    # Done
-    return {
-        "preview_url": f"/public/{os.path.basename(out_path)}",
-        "language": language,
-        "transcript": transcript,
-        "muted_spans": spans,
-    }
+        out_id = uuid.uuid4().hex
+        out_path = os.path.join("public", f"{out_id}.mp3")
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-t", str(int(PREVIEW_T))]
+        if mute_filter:
+            cmd += ["-af", mute_filter]
+        cmd += ["-codec:a", "libmp3lame", "-b:a", "192k", out_path]
+        try:
+            run(cmd)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"ffmpeg_failed: {str(e)}"})
+
+        return {
+            "preview_url": f"/public/{os.path.basename(out_path)}",
+            "language": language,
+            "transcript": transcript_text,
+            "muted_spans": merged,
+        }
+    finally:
+        # cleanup
+        try:
+            if os.path.exists(src):
+                os.unlink(src)
+        except Exception:
+            pass
+        for p in slices:
+            try:
+                if os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
