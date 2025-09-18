@@ -61,21 +61,22 @@ app.post('/preview', upload.single('file'), async (req, res) => {
 
     // --- Work out duration & chunk plan ---
     const dur = await ffprobeDuration(src); // seconds
-    const CHUNK_SEC = 6;      // smaller WAV slices to stay well under CF body cap
+    const CHUNK_SEC = 5;      // smaller slices; keep CF body tiny
 
-    // function to build a tiny WAV slice for [start, start+len]
+    // function to build a tiny MP3 slice for [start, start+len]
     async function makeSlice(start, len){
-      const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.wav`);
+      const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.mp3`);
       const args = [
         '-hide_banner','-loglevel','error','-y',
         '-i',  src,
         // accurate output trim (put -ss/-t after -i)
         '-ss', String(Math.max(0, start)),
         '-t',  String(Math.max(0.1, len)),
-        // robust, CF‑friendly speech format: 16‑bit PCM mono 16 kHz
+        // ultra‑small, CF‑friendly slice: MP3 mono 32 kHz @ 64k
         '-ac','1',
-        '-ar','16000',
-        '-c:a','pcm_s16le',
+        '-ar','32000',
+        '-c:a','libmp3lame',
+        '-b:a','64k',
         out
       ];
       const cmd = `ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
@@ -84,7 +85,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       let st;
       try { st = fs.statSync(out); } catch(e){ st = { size: 0 }; }
       console.log(`[slice] ${path.basename(out)} len=${len.toFixed(3)}s size=${(st.size/1024).toFixed(1)}KB`);
-      if (!st.size || st.size < 1024) throw new Error(`slice_too_small: ${out} (${st.size} bytes)`);
+      if (!st.size || st.size < 4096) throw new Error(`slice_too_small: ${out} (${st.size} bytes)`);
       tmpFiles.push(out);
       return out;
     }
@@ -95,7 +96,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       console.log(`[upload] ${path.basename(filepath)} bytes=${buf.length}`);
       const fd = new FormData();
       fd.append('input', JSON.stringify({ response_format:'verbose_json' }));
-      fd.append('file', new Blob([buf], { type: 'audio/wav' }), path.basename(filepath));
+      fd.append('file', new Blob([buf], { type: 'audio/mpeg' }), path.basename(filepath));
       const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/openai/whisper`;
       const cf  = await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${token}` }, body: fd });
       const j   = await cf.json().catch(()=>({}));
