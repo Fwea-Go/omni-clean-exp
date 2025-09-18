@@ -354,6 +354,8 @@
     buyFull: document.getElementById('buy-full'),
   };
   els.buyFull.href = STRIPE_BUY_LINK;
+  // allow cross‑origin audio from backend domain
+  els.previewAudio.crossOrigin = 'anonymous';
 
   function fmtBytes(bytes){
     if (!bytes && bytes !== 0) return '';
@@ -388,28 +390,36 @@
     }
     setFileMeta(file);
     setStatus('Processing: speech-to-text → detect profanity → mute → 30s preview…');
-    const fd = new FormData(); fd.append('file', file);
+    const fd = new FormData();
+    // include filename for better backend handling on some browsers
+    fd.append('file', file, file.name || 'upload');
     try{
       const res = await fetch(`${BACKEND_BASE.replace(/\/$/,'')}/preview`, { method:'POST', body: fd });
       if (!res.ok) {
+        // Try to surface JSON error payloads from backend (e.g., whisper_failed)
         let msg = 'Backend error ' + res.status;
-        try {
-          const t = await res.text();
+        let bodyText = '';
+        try { bodyText = await res.text(); } catch {}
+        if (bodyText) {
           try {
-            const j = JSON.parse(t);
-            msg += j.error ? `: ${j.error}` : '';
-            if (j.detail) msg += ` • ${JSON.stringify(j.detail).slice(0,300)}`;
+            const j = JSON.parse(bodyText);
+            if (j.error) msg += `: ${j.error}`;
+            if (j.detail) msg += ` • ${typeof j.detail==='string' ? j.detail.slice(0,300) : JSON.stringify(j.detail).slice(0,300)}`;
+            if (j.chunk)  msg += ` • chunk=${JSON.stringify(j.chunk)}`;
           } catch {
-            msg += ` • ${t.slice(0,300)}`;
+            msg += ` • ${bodyText.slice(0,300)}`;
           }
-        } catch {}
+        }
         setStatus(msg);
         return;
       }
       const data = await res.json();
       showPreview(data);
       setStatus('Ready.');
-    }catch(err){ console.error(err); setStatus('Network error. Check CORS / URL.'); }
+    }catch(err){
+      console.error(err);
+      setStatus(`Network error. Check CORS / URL. ${String(err).slice(0,200)}`);
+    }
   }
 
   function showPreview(data){
@@ -424,9 +434,12 @@
       els.transcript.textContent = txt;
     }
     if (preview_url){
-      els.previewAudio.src = `${BACKEND_BASE.replace(/\/$/,'')}${preview_url.startsWith('/')?preview_url:'/'+preview_url}`;
+      const base = BACKEND_BASE.replace(/\/$/,'');
+      const src  = /^https?:\/\//i.test(preview_url) ? preview_url
+                 : `${base}${preview_url.startsWith('/')?preview_url:'/'+preview_url}`;
+      els.previewAudio.src = src;
       els.downloadPreview.classList.remove('hidden');
-      els.downloadPreview.onclick = ()=>{ const a=document.createElement('a'); a.href=els.previewAudio.src; a.download='preview_censored.mp3'; document.body.appendChild(a); a.click(); a.remove(); };
+      els.downloadPreview.onclick = ()=>{ const a=document.createElement('a'); a.href=src; a.download='preview_censored.mp3'; document.body.appendChild(a); a.click(); a.remove(); };
     }
     els.previewCard.classList.remove('hidden');
   }
