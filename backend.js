@@ -63,28 +63,33 @@ app.post('/preview', upload.single('file'), async (req, res) => {
     const dur = await ffprobeDuration(src); // seconds
     const CHUNK_SEC = 5;      // smaller slices; keep CF body tiny
 
-    // function to build a tiny MP3 slice for [start, start+len]
-    async function makeSlice(start, len){
-      const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.mp3`);
+    // build a tiny audio slice for [start, start+len] with configurable codec/profile
+    async function makeSlice(start, len, opts = { codec: 'libmp3lame', hz: 32000, br: '64k' }){
+      const ext = opts.codec === 'libopus' ? 'ogg' : 'mp3';
+      const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.${ext}`);
       const args = [
         '-hide_banner','-loglevel','error','-y',
         '-i',  src,
         // accurate output trim (put -ss/-t after -i)
         '-ss', String(Math.max(0, start)),
         '-t',  String(Math.max(0.1, len)),
-        // ultra‑small, CF‑friendly slice: MP3 mono 32 kHz @ 64k
         '-ac','1',
-        '-ar','32000',
-        '-c:a','libmp3lame',
-        '-b:a','64k',
-        out
+        '-ar', String(opts.hz || 32000),
+        '-c:a', opts.codec,
       ];
+      if (opts.codec === 'libopus') {
+        // Opus VBR at ~24k target
+        args.push('-b:a', opts.br || '24k', '-vbr', 'on', '-compression_level', '10');
+      } else {
+        // MP3 CBR target
+        args.push('-b:a', opts.br || '64k');
+      }
+      args.push(out);
       const cmd = `ffmpeg ${args.map(a=> a.includes(' ')?`"${a}"`:a).join(' ')}`;
       await sh(cmd);
-      // debug: log slice size that we are about to upload
       let st;
       try { st = fs.statSync(out); } catch(e){ st = { size: 0 }; }
-      console.log(`[slice] ${path.basename(out)} len=${len.toFixed(3)}s size=${(st.size/1024).toFixed(1)}KB`);
+      console.log(`[slice] ${path.basename(out)} len=${len.toFixed(3)}s size=${(st.size/1024).toFixed(1)}KB codec=${opts.codec} hz=${opts.hz} br=${opts.br}`);
       if (!st.size || st.size < 4096) throw new Error(`slice_too_small: ${out} (${st.size} bytes)`);
       tmpFiles.push(out);
       return out;
@@ -96,7 +101,8 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       console.log(`[upload] ${path.basename(filepath)} bytes=${buf.length}`);
       const fd = new FormData();
       fd.append('input', JSON.stringify({ response_format:'verbose_json' }));
-      fd.append('file', new Blob([buf], { type: 'audio/mpeg' }), path.basename(filepath));
+      const mime = filepath.endsWith('.ogg') ? 'audio/ogg' : 'audio/mpeg';
+      fd.append('file', new Blob([buf], { type: mime }), path.basename(filepath));
       const url = `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/openai/whisper`;
       const cf  = await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${token}` }, body: fd });
       const j   = await cf.json().catch(()=>({}));
@@ -113,11 +119,33 @@ app.post('/preview', upload.single('file'), async (req, res) => {
 
     for(let start=0; start < total; start += CHUNK_SEC){
       const len = Math.min(CHUNK_SEC, total - start);
-      const slice = await makeSlice(start, len);
-      const r = await whisperFile(slice);
+
+      // try a ladder of smaller encodes / durations if CF says "Request is too large"
+      let slice = await makeSlice(start, len, { codec:'libmp3lame', hz:32000, br:'64k' });
+      let r = await whisperFile(slice);
+
+      const tooLarge = (err) => {
+        try {
+          const b = err && err.body ? (err.body.errors || err.body.error || err.body) : null;
+          const s = JSON.stringify(b||err);
+          return /too large/i.test(s) || /request.*large/i.test(s);
+        } catch { return false; }
+      };
+
+      if(!r.ok && tooLarge(r.error)){
+        try {
+          slice = await makeSlice(start, Math.min(len, 3), { codec:'libmp3lame', hz:24000, br:'48k' });
+          r = await whisperFile(slice);
+        } catch(e){}
+      }
+      if(!r.ok && tooLarge(r.error)){
+        try {
+          slice = await makeSlice(start, Math.min(len, 2), { codec:'libopus', hz:24000, br:'24k' });
+          r = await whisperFile(slice);
+        } catch(e){}
+      }
       if(!r.ok){
-        // if the first chunk fails due to size, bail early with helpful error
-        return res.status(502).json({ error:'whisper_failed', detail:r.error, chunk: { start, len } });
+        return res.status(502).json({ error:'whisper_failed', detail:r.error, chunk: { start, len, retried:true } });
       }
       const result = r.json.result || r.json;
       if(result.language) language = result.language;
