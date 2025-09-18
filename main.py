@@ -52,24 +52,26 @@ def ffprobe_duration(src_path: str) -> float:
         return 0.0
 
 def make_slice(src_path: str, start: float, length: float) -> str:
-    # Produce a tiny 16kHz mono PCM WAV slice for Cloudflare
-    fd, tmpwav = tempfile.mkstemp(suffix=".wav")
+    fd, tmpaud = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", src_path,
+        # accurate output trim (put -ss/-t after -i)
         "-ss", f"{max(0.0, start)}",
         "-t", f"{max(0.1, length)}",
-        "-i", src_path,
+        # ultra‑small, CF‑friendly slice: MP3 mono 32 kHz @ 64k
         "-ac", "1",
-        "-ar", "16000",
-        "-c:a", "pcm_s16le",
-        tmpwav,
+        "-ar", "32000",
+        "-c:a", "libmp3lame",
+        "-b:a", "64k",
+        tmpaud,
     ]
     run(cmd)
-    # sanity: ensure slice is at least ~1KB (prevents empty uploads)
-    if os.path.getsize(tmpwav) < 1024:
-        raise RuntimeError(f"slice_too_small: {tmpwav}")
-    return tmpwav
+    # sanity: ensure slice is at least ~4KB (prevents empty uploads)
+    if os.path.getsize(tmpaud) < 4096:
+        raise RuntimeError(f"slice_too_small: {tmpaud}")
+    return tmpaud
 
 # Cloudflare Whisper call for a local file path
 def whisper_file(filepath: str) -> dict:
@@ -80,7 +82,7 @@ def whisper_file(filepath: str) -> dict:
     # response_format=verbose_json for segments with start/end
     data = {"input": json.dumps({"response_format": "verbose_json"})}
     with open(filepath, "rb") as f:
-        files = {"file": (os.path.basename(filepath), f, "audio/wav")}
+        files = {"file": (os.path.basename(filepath), f, "audio/mpeg")}
         r = requests.post(url, headers=headers, data=data, files=files, timeout=600)
     if not r.ok:
         raise RuntimeError(f"Cloudflare AI error: {r.status_code} {r.text}")
@@ -101,7 +103,7 @@ async def preview(file: UploadFile = File(...)):
     try:
         # --- Plan chunking ---
         dur = ffprobe_duration(src) or 0.0
-        CHUNK_SEC = 6.0
+        CHUNK_SEC = 5.0
         total = dur if dur > 0 else CHUNK_SEC
 
         # --- Transcribe per-slice and accumulate segments ---
@@ -110,13 +112,39 @@ async def preview(file: UploadFile = File(...)):
         t = 0.0
         while t < total - 1e-6:
             length = CHUNK_SEC if (t + CHUNK_SEC) <= total else (total - t)
-            wav = make_slice(src, t, length)
-            slices.append(wav)
+            # try default, then progressively smaller/denser if CF complains
+            wav = make_slice(src, t, length); slices.append(wav)
             try:
                 r = whisper_file(wav)
             except Exception as e:
-                # surface CF specific body-too-large style errors
-                return JSONResponse(status_code=502, content={"error": "whisper_failed", "detail": str(e), "chunk": {"start": t, "len": length}})
+                # If this smells like a "too large" error, retry with smaller slice/bitrate
+                msg = str(e)
+                if re.search(r"too\s+large|request.+large", msg, flags=re.I):
+                    # shorten to 3s
+                    try:
+                        wav2 = make_slice(src, t, min(length, 3.0)); slices.append(wav2)
+                        r = whisper_file(wav2)
+                    except Exception as e2:
+                        msg2 = str(e2)
+                        if re.search(r"too\s+large|request.+large", msg2, flags=re.I):
+                            # shorten further to 2s and drop sample rate/bitrate by re-encoding via ffmpeg args (mp3 path already small)
+                            try:
+                                # extra-tight encode for last resort: 2s @ 24kHz 48k
+                                fd, tmpaud = tempfile.mkstemp(suffix=".mp3"); os.close(fd)
+                                cmd = [
+                                    "ffmpeg","-hide_banner","-loglevel","error","-y","-i",src,
+                                    "-ss",f"{max(0.0,t)}","-t",f"{max(0.1, min(length,2.0))}",
+                                    "-ac","1","-ar","24000","-c:a","libmp3lame","-b:a","48k", tmpaud
+                                ]
+                                run(cmd)
+                                slices.append(tmpaud)
+                                r = whisper_file(tmpaud)
+                            except Exception as e3:
+                                return JSONResponse(status_code=502, content={"error":"whisper_failed","detail":str(e3),"chunk":{"start":t,"len":length,"retried":True}})
+                        else:
+                            return JSONResponse(status_code=502, content={"error":"whisper_failed","detail":msg2,"chunk":{"start":t,"len":length,"retried":True}})
+                else:
+                    return JSONResponse(status_code=502, content={"error": "whisper_failed", "detail": msg, "chunk": {"start": t, "len": length}})
             result = r.get("result") or r
             if result.get("language"):
                 language = result["language"]
