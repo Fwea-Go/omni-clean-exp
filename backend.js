@@ -68,9 +68,10 @@ app.post('/preview', upload.single('file'), async (req, res) => {
       const out = path.join('uploads', `${Date.now().toString(36)}_${Math.round(start*1000)}.wav`);
       const args = [
         '-hide_banner','-loglevel','error','-y',
+        '-i',  src,
+        // accurate output trim (put -ss/-t after -i)
         '-ss', String(Math.max(0, start)),
         '-t',  String(Math.max(0.1, len)),
-        '-i',  src,
         // robust, CF‑friendly speech format: 16‑bit PCM mono 16 kHz
         '-ac','1',
         '-ar','16000',
