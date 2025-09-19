@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
-<head><script type='text/javascript' src='https://ppl-ai-code-interpreter-files.s3.amazonaws.com/femRhnGzvlR4lQRA8uB4zANnIrZ6euwc5W5rIw0AF1dgoC4-Ak-i50Mv-c6SXMOUhSIlX8mhtKhpzBzTtWzdGILfzEI8jh8NVanJHGSc-aRU0V0J_1xOwTKgzuQ1qnNKbtVuNRTsdZOrq93uqDfAcxEPlbQBJUhJB5Bfwugfsmg='></script>
+<head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FWEA-I Clean Editor - Optimized</title>
@@ -306,6 +306,26 @@
             display: block;
         }
 
+        .connection-status {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .connection-status.connected {
+            border-left: 4px solid #28a745;
+        }
+
+        .connection-status.disconnected {
+            border-left: 4px solid #dc3545;
+        }
+
+        .connection-status.checking {
+            border-left: 4px solid #ffc107;
+        }
+
         @media (max-width: 768px) {
             .header h1 {
                 font-size: 2rem;
@@ -327,13 +347,17 @@
             }
         }
     </style>
-</head>
+<script type='text/javascript' src='https://ppl-ai-code-interpreter-files.s3.amazonaws.com/lSMvTRWodmTVjm8qsC6ENEp4gKXt6pk9zGwhQnosFb3d9szMN8_9TGTzGOPyL7g3n__3iPGRBRLJgOuRV_CTVj2ebdiSUIKk_yLLpzX6FMYk2liX_8sqjlLi984ad18AcagoyL4FJVbfKUEmd-9NCbpskVVGFrS7cMQDK64T4Rw='></script></head>
 <body>
     <div class="container">
         <div class="header">
             <h1>FWEA-I OMNILINGUAL CLEAN VERSION EDITOR</h1>
             <p>Enhanced audio processing with optimized file size handling</p>
-            <span class="version-badge">Version 2.0 - Optimized</span>
+            <span class="version-badge">Version 2.0 - Fixed</span>
+        </div>
+
+        <div class="connection-status checking" id="connectionStatus">
+            <span id="connectionText">🔍 Checking server connection...</span>
         </div>
 
         <div class="upload-section">
@@ -411,12 +435,13 @@
     </div>
 
     <script>
-        // Enhanced file handling with size optimization awareness
-        const API_BASE = window.location.origin.includes('localhost') ? 'http://localhost:8000' : '/api';
+        // FIXED: Properly configure API base URL for your domain
+        const API_BASE = 'https://clean.fwea-i.com';
         const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
         const LARGE_FILE_THRESHOLD = 20 * 1024 * 1024; // 20MB
 
         let selectedFile = null;
+        let serverOnline = false;
 
         // DOM elements
         const dropZone = document.getElementById('dropZone');
@@ -426,6 +451,8 @@
         const progressSection = document.getElementById('progressSection');
         const resultsSection = document.getElementById('resultsSection');
         const errorMessage = document.getElementById('errorMessage');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const connectionText = document.getElementById('connectionText');
 
         // Enhanced drag and drop handling
         dropZone.addEventListener('click', () => fileInput.click());
@@ -512,6 +539,11 @@
                 return;
             }
 
+            if (!serverOnline) {
+                showError('Server is not available. Please check your connection and try again.');
+                return;
+            }
+
             const processBtn = document.getElementById('processBtn');
             processBtn.disabled = true;
             processBtn.textContent = '🔄 Processing...';
@@ -526,13 +558,22 @@
 
                 updateProgress('Uploading audio file...', 10);
 
+                console.log(`Making request to: ${API_BASE}/preview`);
+
                 const response = await fetch(`${API_BASE}/preview`, {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    headers: {
+                        // Don't set Content-Type header - let browser set it with boundary for FormData
+                    }
                 });
+
+                console.log('Response status:', response.status);
+                console.log('Response headers:', [...response.headers.entries()]);
 
                 if (!response.ok) {
                     const errorData = await response.json().catch(() => ({}));
+                    console.error('API Error:', errorData);
                     
                     if (response.status === 413) {
                         throw new Error(
@@ -544,6 +585,15 @@
                             `Processing failed: ${errorData.detail || 'Server error'}. ` +
                             `This usually happens with large files. Try a shorter audio clip or lower quality file.`
                         );
+                    } else if (response.status === 405) {
+                        throw new Error(
+                            `Method not allowed (405). The server may not be properly configured. ` +
+                            `Please check the API endpoint configuration.`
+                        );
+                    } else if (response.status === 0 || response.status >= 500) {
+                        throw new Error(
+                            `Server unavailable (${response.status}). Please check if the API server is running and try again.`
+                        );
                     }
                     
                     throw new Error(errorData.detail || errorData.message || `Server error: ${response.status}`);
@@ -552,6 +602,7 @@
                 updateProgress('Processing audio...', 50);
 
                 const result = await response.json();
+                console.log('API Response:', result);
 
                 updateProgress('Generating preview...', 90);
 
@@ -576,6 +627,16 @@
                                '• Use a shorter audio clip (under 2-3 minutes)\n' +
                                '• Compress your audio file (lower bitrate/sample rate)\n' +
                                '• Convert to MP3 format for better compression';
+                } else if (errorMsg.includes('405') || errorMsg.includes('Method not allowed')) {
+                    errorMsg += '\n\n💡 Server Configuration Issue:\n' +
+                               '• The API endpoint may not be properly configured\n' +
+                               '• Check if the server supports POST requests to /preview\n' +
+                               '• Verify CORS settings are correct';
+                } else if (errorMsg.includes('Failed to fetch') || errorMsg.includes('unavailable')) {
+                    errorMsg += '\n\n💡 Connection Issue:\n' +
+                               '• Check your internet connection\n' +
+                               '• Verify the API server is running\n' +
+                               '• Try refreshing the page';
                 }
                 
                 showError(errorMsg);
@@ -586,16 +647,24 @@
         }
 
         function displayResults(result) {
-            // Set audio source
+            // Set audio source with proper base URL handling
             const audioElement = document.getElementById('audioPreview');
-            audioElement.src = `${API_BASE}${result.preview_url}`;
+            const previewUrl = result.preview_url;
+            
+            // Handle both absolute and relative URLs
+            if (previewUrl.startsWith('http')) {
+                audioElement.src = previewUrl;
+            } else {
+                audioElement.src = `${API_BASE}${previewUrl}`;
+            }
 
             // Display statistics
             const metadata = result.metadata || {};
             document.getElementById('processingTime').textContent = 
-                metadata.processing_time_seconds ? `${metadata.processing_time_seconds.toFixed(1)}s` : '-';
-            document.getElementById('segmentCount').textContent = metadata.segment_count || '-';
-            document.getElementById('mutedSpans').textContent = metadata.muted_span_count || '0';
+                metadata.processing_time_seconds ? `${metadata.processing_time_seconds.toFixed(1)}s` : 
+                metadata.processingTimeMs ? `${(metadata.processingTimeMs/1000).toFixed(1)}s` : '-';
+            document.getElementById('segmentCount').textContent = metadata.segment_count || metadata.segmentCount || '-';
+            document.getElementById('mutedSpans').textContent = metadata.muted_span_count || metadata.mutedSpanCount || '0';
             document.getElementById('detectedLanguage').textContent = result.language || 'Unknown';
 
             // Display transcript
@@ -639,25 +708,68 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
-        // Health check on load
-        fetch(`${API_BASE}/health`)
-            .then(response => response.json())
-            .then(data => {
-                console.log('API Health:', data);
-                if (!data.environment?.has_cloudflare_credentials) {
-                    showError('⚠️ Server configuration issue: Missing Cloudflare credentials. Please contact support.');
-                }
-            })
-            .catch(error => {
-                console.error('Health check failed:', error);
-                showError('⚠️ Unable to connect to processing server. Please check your connection and try again.');
-            });
+        function updateConnectionStatus(status, message) {
+            connectionStatus.className = `connection-status ${status}`;
+            connectionText.textContent = message;
+        }
 
-        // Version marker fetch (helps confirm we are hitting the right API host)
-        fetch(`${API_BASE}/__version`)
-            .then(r => r.json())
-            .then(v => console.log('API Version:', v))
-            .catch(err => console.warn('Version check failed:', err));
+        // Enhanced health check and connection testing
+        async function checkServerConnection() {
+            updateConnectionStatus('checking', '🔍 Checking server connection...');
+            
+            try {
+                console.log(`Checking connection to: ${API_BASE}`);
+                
+                // Try to fetch the root endpoint first
+                const rootResponse = await fetch(`${API_BASE}/`, {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json',
+                    },
+                    timeout: 10000
+                });
+
+                console.log('Root endpoint response:', rootResponse.status, rootResponse.statusText);
+
+                if (rootResponse.ok) {
+                    const data = await rootResponse.json().catch(() => ({}));
+                    console.log('Root endpoint data:', data);
+                    
+                    serverOnline = true;
+                    updateConnectionStatus('connected', '✅ Server online and ready');
+                    
+                    // Check if credentials are configured
+                    if (data.environment && !data.environment.has_cloudflare_credentials) {
+                        updateConnectionStatus('connected', '⚠️ Server online but missing Cloudflare credentials');
+                    }
+                } else {
+                    throw new Error(`Server responded with ${rootResponse.status}`);
+                }
+
+            } catch (error) {
+                console.error('Connection check failed:', error);
+                serverOnline = false;
+                updateConnectionStatus('disconnected', `❌ Server unavailable: ${error.message}`);
+                
+                showError(
+                    '⚠️ Unable to connect to the processing server. ' +
+                    'Please check that the server is running at https://clean.fwea-i.com/ and try again.'
+                );
+            }
+        }
+
+        // Run connection check on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            checkServerConnection();
+            
+            // Recheck connection every 30 seconds
+            setInterval(checkServerConnection, 30000);
+        });
+
+        // Add retry button functionality
+        window.retryConnection = function() {
+            checkServerConnection();
+        };
     </script>
 </body>
 </html>
