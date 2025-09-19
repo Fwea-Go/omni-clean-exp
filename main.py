@@ -1,17 +1,21 @@
-from fastapi import FastAPI, UploadFile, File
+# FWEA-I Clean Editor - Optimized FastAPI Backend
+# Enhanced version with better file size handling and error management
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 import os, io, json, re, tempfile, subprocess, uuid, requests
+import asyncio
+from pathlib import Path
+import time
 
-# -------- CONFIG --------
-# Set these as environment variables (export in shell or systemd)
+# -------- ENHANCED CONFIG --------
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
-CF_API_TOKEN  = os.getenv("CF_API_TOKEN", "")
-# Cloudflare Whisper model id
+CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 WHISPER_MODEL = "@cf/openai/whisper"
 
-# Basic multilingual profanity list (starter; expand as needed)
+# Enhanced multilingual profanity detection
 BAD_WORDS = [
     # English
     r"\b(fuck|shit|bitch|asshole|cunt|motherfucker|dick|pussy|nigga|nigger|hoe|slut)\b",
@@ -19,199 +23,451 @@ BAD_WORDS = [
     r"\b(puta|puto|pendejo|mierda|cabron|coño)\b",
     # French
     r"\b(putain|merde|salope|con)\b",
-    # Haitian Creole (starter)
-    r"\b(bitch|koko|vagin|kaka|manmanw|manman’w)\b",
+    # Haitian Creole
+    r"\b(bitch|koko|vagin|kaka|manmanw|manman'w)\b",
     # Portuguese
     r"\b(merda|caralho|porra|puta)\b",
-    # …add more langs/variants
+    # Add more languages as needed
 ]
+
 BAD_RE = re.compile("|".join(BAD_WORDS), flags=re.IGNORECASE)
 
-app = FastAPI()
+# File size limits
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_CHUNK_SIZE = 5 * 1024 * 1024    # 5MB for Whisper API
+
+app = FastAPI(
+    title="FWEA-I Clean Editor API",
+    description="Optimized audio processing with enhanced file size handling",
+    version="2.0"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 # Serve generated previews
 os.makedirs("public", exist_ok=True)
 app.mount("/public", StaticFiles(directory="public"), name="public")
 
-def run(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr)
-    return p.stdout
-
-# --- FFmpeg/ffprobe helpers ---
-def ffprobe_duration(src_path: str) -> float:
+def run_command(cmd, timeout=30):
+    """Enhanced command runner with timeout"""
     try:
-        out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", src_path])
-        return float(out.strip())
-    except Exception:
+        p = subprocess.run(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True,
+            timeout=timeout
+        )
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr)
+        return p.stdout
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Command timeout after {timeout}s")
+
+def get_file_size(filepath: str) -> int:
+    """Get file size safely"""
+    try:
+        return os.path.getsize(filepath)
+    except:
+        return 0
+
+def ffprobe_duration(src_path: str) -> float:
+    """Enhanced duration detection with fallback"""
+    try:
+        out = run_command([
+            "ffprobe", "-v", "quiet", 
+            "-show_entries", "format=duration", 
+            "-of", "csv=p=0", src_path
+        ], timeout=10)
+        duration = float(out.strip())
+        return duration if duration > 0 else 0.0
+    except Exception as e:
+        print(f"Duration probe failed: {e}")
         return 0.0
 
-def make_slice(src_path: str, start: float, length: float) -> str:
-    fd, tmpaud = tempfile.mkstemp(suffix=".mp3")
+def make_optimized_slice(src_path: str, start: float, length: float, level: int = 1) -> str:
+    """Create optimized audio slice with multiple compression levels"""
+    
+    # Optimization levels - progressively more aggressive
+    configs = [
+        {"hz": 32000, "br": "64k", "codec": "libmp3lame", "ext": "mp3"},   # Level 1: Standard
+        {"hz": 24000, "br": "48k", "codec": "libmp3lame", "ext": "mp3"},   # Level 2: Reduced
+        {"hz": 16000, "br": "32k", "codec": "libmp3lame", "ext": "mp3"},   # Level 3: Minimal
+        {"hz": 16000, "br": "24k", "codec": "libopus", "ext": "ogg"},      # Level 4: Opus
+        {"hz": 8000, "br": "16k", "codec": "libopus", "ext": "ogg"},       # Level 5: Ultra minimal
+    ]
+    
+    config = configs[min(level - 1, len(configs) - 1)]
+    
+    fd, tmpaud = tempfile.mkstemp(suffix=f".{config['ext']}")
     os.close(fd)
+    
+    # Adjust duration for higher levels
+    if level > 2:
+        length = min(length, 1.5)  # Max 1.5s for levels 3+
+    if level > 4:
+        length = min(length, 1.0)  # Max 1s for level 5
+    
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", src_path,
-        # accurate output trim (put -ss/-t after -i)
         "-ss", f"{max(0.0, start)}",
         "-t", f"{max(0.1, length)}",
-        # ultra‑small, CF‑friendly slice: MP3 mono 32 kHz @ 64k
-        "-ac", "1",
-        "-ar", "32000",
-        "-c:a", "libmp3lame",
-        "-b:a", "64k",
-        tmpaud,
+        "-ac", "1",  # Force mono
+        "-ar", str(config["hz"]),
+        "-c:a", config["codec"],
     ]
-    run(cmd)
-    # sanity: ensure slice is at least ~4KB (prevents empty uploads)
-    if os.path.getsize(tmpaud) < 4096:
-        raise RuntimeError(f"slice_too_small: {tmpaud}")
-    return tmpaud
+    
+    if config["codec"] == "libopus":
+        cmd.extend(["-b:a", config["br"], "-vbr", "on", "-compression_level", "10"])
+    else:
+        cmd.extend(["-b:a", config["br"], "-q:a", "9"])  # Highest compression
+    
+    cmd.append(tmpaud)
+    
+    try:
+        run_command(cmd, timeout=15)
+        
+        # Verify output
+        size = get_file_size(tmpaud)
+        if size < 4096:
+            os.unlink(tmpaud)
+            raise RuntimeError(f"Slice too small: {size} bytes")
+        
+        print(f"[slice L{level}] {os.path.basename(tmpaud)} len={length:.2f}s size={size/1024:.1f}KB codec={config['codec']}")
+        return tmpaud
+        
+    except Exception as e:
+        if os.path.exists(tmpaud):
+            os.unlink(tmpaud)
+        raise e
 
-# Cloudflare Whisper call for a local file path
-def whisper_file(filepath: str) -> dict:
+def whisper_file_enhanced(filepath: str, level: int = 1) -> dict:
+    """Enhanced Whisper API call with better error handling"""
     if not (CF_ACCOUNT_ID and CF_API_TOKEN):
         raise RuntimeError("Missing CF_ACCOUNT_ID / CF_API_TOKEN")
+    
+    file_size = get_file_size(filepath)
+    
+    # Pre-flight size check
+    if file_size > MAX_CHUNK_SIZE:
+        raise RuntimeError(f"File too large for Whisper API: {file_size/1024/1024:.1f}MB")
+    
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{WHISPER_MODEL}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
-    # response_format=verbose_json for segments with start/end
     data = {"input": json.dumps({"response_format": "verbose_json"})}
-    with open(filepath, "rb") as f:
-        files = {"file": (os.path.basename(filepath), f, "audio/mpeg")}
-        r = requests.post(url, headers=headers, data=data, files=files, timeout=600)
-    if not r.ok:
-        raise RuntimeError(f"Cloudflare AI error: {r.status_code} {r.text}")
-    return r.json()  # {"result": {"segments":[...], "language":".." }}
+    
+    print(f"[whisper L{level}] {os.path.basename(filepath)} bytes={file_size}")
+    
+    try:
+        with open(filepath, "rb") as f:
+            files = {"file": (os.path.basename(filepath), f, "audio/mpeg")}
+            r = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+        
+        if not r.ok:
+            error_text = r.text.lower()
+            is_too_large = any(phrase in error_text for phrase in [
+                "too large", "entity too large", "payload too large", "request too large"
+            ])
+            is_rate_limit = r.status_code == 429 or "rate limit" in error_text
+            
+            return {
+                "success": False,
+                "error": {
+                    "status": r.status_code,
+                    "message": r.text,
+                    "file": os.path.basename(filepath),
+                    "bytes": file_size,
+                    "level": level
+                },
+                "is_too_large": is_too_large,
+                "is_rate_limit": is_rate_limit,
+                "should_retry": is_too_large or is_rate_limit
+            }
+        
+        return {"success": True, "data": r.json()}
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": {
+                "message": str(e),
+                "file": os.path.basename(filepath),
+                "bytes": file_size,
+                "level": level
+            },
+            "is_too_large": False,
+            "is_rate_limit": False,
+            "should_retry": False
+        }
 
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "message": "FWEA-I Clean Editor API (Optimized)",
+        "version": "2.0",
+        "limits": {
+            "max_file_size": f"{MAX_UPLOAD_SIZE//1024//1024}MB",
+            "max_chunk_duration": "2s",
+            "supported_formats": ["mp3", "wav", "m4a", "aac", "flac", "ogg"]
+        }
+    }
 
-
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "timestamp": time.time(),
+        "environment": {
+            "has_cloudflare_credentials": bool(CF_ACCOUNT_ID and CF_API_TOKEN),
+            "python_version": f"{os.sys.version_info.major}.{os.sys.version_info.minor}",
+            "fastapi_version": "Latest"
+        }
+    }
 
 @app.post("/preview")
 async def preview(file: UploadFile = File(...)):
-    # Save upload to temp
-    suffix = os.path.splitext(file.filename or "audio")[1] or ".wav"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(await file.read()); tmp.flush(); tmp.close()
-    src = tmp.name
-
-    slices = []
+    start_time = time.time()
+    temp_files = []
+    
     try:
-        # --- Plan chunking ---
-        dur = ffprobe_duration(src) or 0.0
-        CHUNK_SEC = 5.0
-        total = dur if dur > 0 else CHUNK_SEC
-
-        # --- Transcribe per-slice and accumulate segments ---
+        # Validate file
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        
+        # Save uploaded file
+        suffix = Path(file.filename).suffix or ".wav"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        
+        # Check file size during upload
+        content = await file.read()
+        if len(content) > MAX_UPLOAD_SIZE:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "error": "file_too_large",
+                    "message": f"File exceeds {MAX_UPLOAD_SIZE//1024//1024}MB limit",
+                    "file_size": len(content),
+                    "max_size": MAX_UPLOAD_SIZE
+                }
+            )
+        
+        tmp.write(content)
+        tmp.flush()
+        tmp.close()
+        src = tmp.name
+        
+        print(f"[upload] {file.filename} size={len(content)/1024/1024:.1f}MB")
+        
+        # Get audio duration
+        dur = ffprobe_duration(src)
+        if dur == 0:
+            os.unlink(src)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_audio_file",
+                    "message": "Could not read audio file. Please check format."
+                }
+            )
+        
+        print(f"[audio] duration={dur:.1f}s")
+        
+        # Process in smaller chunks
+        INITIAL_CHUNK_SEC = 2.0  # Start with 2s chunks
         full_segments = []
         language = "auto"
+        
+        retry_count = 0
+        max_retries = 3
+        
         t = 0.0
-        while t < total - 1e-6:
-            length = CHUNK_SEC if (t + CHUNK_SEC) <= total else (total - t)
-            # try default, then progressively smaller/denser if CF complains
-            wav = make_slice(src, t, length); slices.append(wav)
-            try:
-                r = whisper_file(wav)
-            except Exception as e:
-                # If this smells like a "too large" error, retry with smaller slice/bitrate
-                msg = str(e)
-                if re.search(r"too\s+large|request.+large", msg, flags=re.I):
-                    # shorten to 3s
-                    try:
-                        wav2 = make_slice(src, t, min(length, 3.0)); slices.append(wav2)
-                        r = whisper_file(wav2)
-                    except Exception as e2:
-                        msg2 = str(e2)
-                        if re.search(r"too\s+large|request.+large", msg2, flags=re.I):
-                            # shorten further to 2s and drop sample rate/bitrate by re-encoding via ffmpeg args (mp3 path already small)
-                            try:
-                                # extra-tight encode for last resort: 2s @ 24kHz 48k
-                                fd, tmpaud = tempfile.mkstemp(suffix=".mp3"); os.close(fd)
-                                cmd = [
-                                    "ffmpeg","-hide_banner","-loglevel","error","-y","-i",src,
-                                    "-ss",f"{max(0.0,t)}","-t",f"{max(0.1, min(length,2.0))}",
-                                    "-ac","1","-ar","24000","-c:a","libmp3lame","-b:a","48k", tmpaud
-                                ]
-                                run(cmd)
-                                slices.append(tmpaud)
-                                r = whisper_file(tmpaud)
-                            except Exception as e3:
-                                return JSONResponse(status_code=502, content={"error":"whisper_failed","detail":str(e3),"chunk":{"start":t,"len":length,"retried":True}})
-                        else:
-                            return JSONResponse(status_code=502, content={"error":"whisper_failed","detail":msg2,"chunk":{"start":t,"len":length,"retried":True}})
-                else:
-                    return JSONResponse(status_code=502, content={"error": "whisper_failed", "detail": msg, "chunk": {"start": t, "len": length}})
-            result = r.get("result") or r
-            if result.get("language"):
-                language = result["language"]
-            segs = result.get("segments") or []
-            for s in segs:
-                st = float(s.get("start", 0.0)) + t
-                en = float(s.get("end", 0.0)) + t
-                full_segments.append({"start": st, "end": en, "text": s.get("text", "")})
-            t += CHUNK_SEC
-
-        # --- Profanity spans based on segments ---
-        transcript_text = " ".join((s.get("text") or "").strip() for s in full_segments).strip()
+        while t < dur:
+            chunk_length = min(INITIAL_CHUNK_SEC, dur - t)
+            success = False
+            
+            # Try multiple optimization levels
+            for level in range(1, 6):
+                try:
+                    # Create optimized slice
+                    slice_path = make_optimized_slice(src, t, chunk_length, level)
+                    temp_files.append(slice_path)
+                    
+                    # Call Whisper API
+                    result = whisper_file_enhanced(slice_path, level)
+                    
+                    if result["success"]:
+                        data = result["data"]
+                        result_data = data.get("result", data)
+                        
+                        if result_data.get("language"):
+                            language = result_data["language"]
+                        
+                        segments = result_data.get("segments", [])
+                        for s in segments:
+                            st = float(s.get("start", 0.0)) + t
+                            en = float(s.get("end", 0.0)) + t
+                            full_segments.append({
+                                "start": st,
+                                "end": en,
+                                "text": s.get("text", "")
+                            })
+                        
+                        success = True
+                        print(f"[success] chunk {t:.1f}s processed with level {level}")
+                        break
+                        
+                    elif result["should_retry"] and level < 5:
+                        print(f"[retry] chunk {t:.1f}s failed at level {level}, trying level {level + 1}")
+                        continue
+                        
+                    elif result["is_rate_limit"]:
+                        print("[rate-limit] waiting 2s...")
+                        await asyncio.sleep(2)
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            level -= 1  # Retry same level
+                            continue
+                    
+                    if level == 5:
+                        raise Exception(f"All optimization levels failed: {result['error']}")
+                        
+                except Exception as e:
+                    print(f"[error] level {level}: {e}")
+                    if level == 5:
+                        return JSONResponse(
+                            status_code=502,
+                            content={
+                                "error": "whisper_failed",
+                                "detail": str(e),
+                                "chunk": {"start": t, "length": chunk_length, "level": level},
+                                "suggestion": "Try a shorter audio file or reduce quality"
+                            }
+                        )
+            
+            t += INITIAL_CHUNK_SEC
+        
+        # Build profanity spans
+        transcript_text = " ".join(s.get("text", "").strip() for s in full_segments).strip()
+        
         spans = []
         for s in full_segments:
             if BAD_RE.search(s.get("text", "")):
-                spans.append({"start": max(0.0, s["start"]), "end": max(0.0, s["end"]), "reason": "profanity"})
-        spans.sort(key=lambda x: x["start"]) 
+                spans.append({
+                    "start": max(0.0, s["start"]),
+                    "end": max(0.0, s["end"]),
+                    "reason": "profanity"
+                })
+        
+        spans.sort(key=lambda x: x["start"])
+        
+        # Merge overlapping spans
         merged = []
         for s in spans:
             if not merged or s["start"] > merged[-1]["end"]:
                 merged.append(dict(s))
             else:
                 merged[-1]["end"] = max(merged[-1]["end"], s["end"])
-
-        # --- Render 30s preview from original upload with mutes intersecting [0,30] ---
+        
+        # Generate preview
         PREVIEW_T = 30.0
         to_mute = []
+        
         for s in merged:
             if s["end"] > 0 and s["start"] < PREVIEW_T:
                 to_mute.append({
                     "start": max(0.0, s["start"]),
-                    "end": min(PREVIEW_T, s["end"]),
+                    "end": min(PREVIEW_T, s["end"])
                 })
-        # Build ffmpeg -af filter
+        
+        # Build audio filter
         filters = []
         for s in to_mute:
             if s["end"] > s["start"]:
                 filters.append(f"volume=enable='between(t,{s['start']:.3f},{s['end']:.3f})':volume=0")
+        
         mute_filter = ",".join(filters) if filters else None
-
+        
+        # Generate preview file
         out_id = uuid.uuid4().hex
         out_path = os.path.join("public", f"{out_id}.mp3")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-t", str(int(PREVIEW_T))]
+        
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", src, "-t", str(int(PREVIEW_T)),
+            "-ac", "2",  # Stereo for preview
+            "-ar", "44100",  # Standard quality
+            "-codec:a", "libmp3lame", "-b:a", "192k"
+        ]
+        
         if mute_filter:
-            cmd += ["-af", mute_filter]
-        cmd += ["-codec:a", "libmp3lame", "-b:a", "192k", out_path]
+            cmd.insert(-4, "-af")
+            cmd.insert(-4, mute_filter)
+        
+        cmd.append(out_path)
+        
         try:
-            run(cmd)
+            run_command(cmd, timeout=30)
         except Exception as e:
-            return JSONResponse(status_code=500, content={"error": f"ffmpeg_failed: {str(e)}"})
-
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "preview_generation_failed", "detail": str(e)}
+            )
+        
+        processing_time = time.time() - start_time
+        
+        print(f"[complete] processed in {processing_time:.1f}s, {len(full_segments)} segments, {len(merged)} muted spans")
+        
         return {
             "preview_url": f"/public/{os.path.basename(out_path)}",
             "language": language,
             "transcript": transcript_text,
             "muted_spans": merged,
+            "metadata": {
+                "processing_time_seconds": processing_time,
+                "segment_count": len(full_segments),
+                "original_duration": dur,
+                "original_size": len(content),
+                "muted_span_count": len(merged)
+            }
         }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Processing error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "processing_failed",
+                "detail": str(e),
+                "suggestion": "Please try with a smaller or different audio file"
+            }
+        )
     finally:
-        # cleanup
+        # Cleanup
         try:
-            if os.path.exists(src):
+            if 'src' in locals() and os.path.exists(src):
                 os.unlink(src)
-        except Exception:
+        except:
             pass
-        for p in slices:
+        
+        for temp_file in temp_files:
             try:
-                if os.path.exists(p):
-                    os.unlink(p)
-            except Exception:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except:
                 pass
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
