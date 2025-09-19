@@ -448,6 +448,18 @@ app.get('/health', (req, res) => {
     });
 });
 
+// Version marker endpoint for quick sanity checks
+app.get('/__version', (_req, res) => {
+    res.json({
+        ok: true,
+        backend: 'node',
+        name: 'FWEA-I Clean Editor API (Optimized)',
+        version: '2.0',
+        build: 'ladder-1 mp3/opus chunks',
+        time: new Date().toISOString()
+    });
+});
+
 app.listen(port, () => {
     console.log(`🚀 Optimized Clean Editor API on http://0.0.0.0:${port}`);
     console.log(`✅ Enhanced file size handling and error management enabled`);
