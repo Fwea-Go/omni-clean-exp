@@ -78,6 +78,45 @@
             margin-bottom: 30px;
         }
 
+        .connection-status {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            padding: 15px 20px;
+            margin-bottom: 20px;
+            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .connection-status.connected {
+            border-left: 4px solid #28a745;
+        }
+
+        .connection-status.disconnected {
+            border-left: 4px solid #dc3545;
+        }
+
+        .connection-status.checking {
+            border-left: 4px solid #ffc107;
+        }
+
+        .retry-btn {
+            background: #6c757d;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            margin-left: 10px;
+        }
+
+        .retry-btn:hover {
+            background: #5a6268;
+        }
+
         .file-drop-zone {
             border: 3px dashed #667eea;
             border-radius: 15px;
@@ -106,6 +145,12 @@
             transform: scale(1.02);
         }
 
+        .file-drop-zone.disabled {
+            pointer-events: none;
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
         .file-input {
             position: absolute;
             top: 0;
@@ -114,12 +159,14 @@
             height: 100%;
             opacity: 0;
             cursor: pointer;
+            z-index: 1;
         }
 
         .upload-icon {
             font-size: 4rem;
             color: #667eea;
             margin-bottom: 20px;
+            pointer-events: none;
         }
 
         .upload-text {
@@ -127,36 +174,14 @@
             color: #667eea;
             font-weight: 600;
             margin-bottom: 10px;
+            pointer-events: none;
         }
 
         .upload-subtext {
             color: #888;
             font-size: 1rem;
             margin-bottom: 20px;
-        }
-
-        .connection-status {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 15px;
-            padding: 15px 20px;
-            margin-bottom: 20px;
-            text-align: center;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-        }
-
-        .connection-status.connected {
-            border-left: 4px solid #28a745;
-        }
-
-        .connection-status.disconnected {
-            border-left: 4px solid #dc3545;
-        }
-
-        .connection-status.checking {
-            border-left: 4px solid #ffc107;
+            pointer-events: none;
         }
 
         .file-info {
@@ -274,23 +299,6 @@
             width: 0%;
             transition: width 0.5s ease;
             border-radius: 6px;
-            position: relative;
-        }
-
-        .progress-fill::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            bottom: 0;
-            right: 0;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-            animation: shimmer 2s infinite;
-        }
-
-        @keyframes shimmer {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(100%); }
         }
 
         .results-section {
@@ -422,21 +430,6 @@
             display: block;
         }
 
-        .retry-btn {
-            background: #6c757d;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 20px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            margin-left: 10px;
-        }
-
-        .retry-btn:hover {
-            background: #5a6268;
-        }
-
         @media (max-width: 768px) {
             .header h1 {
                 font-size: 2rem;
@@ -461,7 +454,7 @@
             }
         }
     </style>
-<script type='text/javascript' src='https://ppl-ai-code-interpreter-files.s3.amazonaws.com/NJYlJBY-uzfvlKWlieFQCHNgO7V3-XLeMkWLKX9_fob-SFlaAfbnkAYZfNVk8x9GA-lq9jShIuQVPek7rGlHU0iOq0RbryCDoib-OmpVhnyHStIwvv5urjQWj9w33indcNBBEQkTD79Nn8obparK5u47CC9G301ytsCT6l5qE7k='></script></head>
+<script type='text/javascript' src='https://ppl-ai-code-interpreter-files.s3.amazonaws.com/HYVSf9JLRn946NmFlPUcBVNLPE5ex8C_LBQGErJDSK3vn4U0YI427QsHRNrZrGxpwYKk_ytU12NoQ5L5c3LKMV6Yl6RX28x7hhgwMwrrJ0w4B-eFkjLCv76lnxtuNjBnpuQyMz-KjGcSkZ5eVTk_4rHKT6YTzYY8zb6fZ123g-s='></script></head>
 <body>
     <div class="container">
         <div class="header">
@@ -579,13 +572,14 @@
     </div>
 
     <script>
-        // PROFESSIONAL API CONFIGURATION
+        // FIXED API CONFIGURATION
         const API_BASE = 'https://clean.fwea-i.com';
         const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
         const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024; // 50MB
 
         let selectedFile = null;
         let serverOnline = false;
+        let fileInputLocked = false; // Prevent multiple file selections
 
         // DOM elements
         const dropZone = document.getElementById('dropZone');
@@ -599,40 +593,90 @@
         const connectionText = document.getElementById('connectionText');
         const retryBtn = document.getElementById('retryBtn');
 
-        // Enhanced drag and drop handling
-        dropZone.addEventListener('click', () => fileInput.click());
+        // FIXED: Enhanced event handling to prevent double-triggering
+        dropZone.addEventListener('click', handleDropZoneClick);
         dropZone.addEventListener('dragover', handleDragOver);
         dropZone.addEventListener('dragleave', handleDragLeave);
         dropZone.addEventListener('drop', handleDrop);
         fileInput.addEventListener('change', handleFileSelect);
 
+        function handleDropZoneClick(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            
+            // Prevent multiple clicks
+            if (fileInputLocked) {
+                console.log('[FILE_INPUT] Click ignored - locked');
+                return;
+            }
+
+            // Don't trigger if server is offline
+            if (!serverOnline) {
+                showError('Server is not available. Please wait for connection...');
+                return;
+            }
+
+            console.log('[FILE_INPUT] Drop zone clicked - triggering file selector');
+            fileInputLocked = true;
+            
+            // Reset the input to allow selecting the same file again
+            fileInput.value = '';
+            fileInput.click();
+            
+            // Unlock after a short delay
+            setTimeout(() => {
+                fileInputLocked = false;
+            }, 1000);
+        }
+
         function handleDragOver(e) {
             e.preventDefault();
+            e.stopPropagation();
             dropZone.classList.add('dragover');
         }
 
         function handleDragLeave(e) {
             e.preventDefault();
+            e.stopPropagation();
             dropZone.classList.remove('dragover');
         }
 
         function handleDrop(e) {
             e.preventDefault();
+            e.stopPropagation();
             dropZone.classList.remove('dragover');
+            
+            if (fileInputLocked) {
+                console.log('[FILE_INPUT] Drop ignored - locked');
+                return;
+            }
+
             const files = e.dataTransfer.files;
             if (files.length > 0) {
+                console.log('[FILE_INPUT] File dropped:', files[0].name);
                 processFileSelection(files[0]);
             }
         }
 
         function handleFileSelect(e) {
+            console.log('[FILE_INPUT] File input changed');
+            
+            // Prevent processing if locked
+            if (fileInputLocked && e.target.files.length === 0) {
+                console.log('[FILE_INPUT] File selection ignored - locked');
+                return;
+            }
+
             const files = e.target.files;
             if (files.length > 0) {
+                console.log('[FILE_INPUT] File selected:', files[0].name);
                 processFileSelection(files[0]);
             }
         }
 
         function processFileSelection(file) {
+            console.log('[PROCESS_FILE]', file.name, formatFileSize(file.size));
+            
             selectedFile = file;
             
             if (!validateFile(file)) {
@@ -700,6 +744,10 @@
             processBtn.disabled = true;
             processBtn.textContent = '🔄 Processing...';
 
+            // Disable file input during processing
+            dropZone.classList.add('disabled');
+            fileInputLocked = true;
+
             showProgress();
             hideError();
             hideResults();
@@ -728,6 +776,10 @@
                         errorMsg = `File too large for processing: ${formatFileSize(selectedFile.size)}\n` +
                                   `The server rejected the upload.\n\n` +
                                   `💡 Try:\n• Shorter audio clip\n• Compress the file\n• Use MP3 format`;
+                    } else if (response.status === 404) {
+                        errorMsg = `Server endpoint not found (404)\n` +
+                                  `This usually means your backend is not running or configured properly.\n\n` +
+                                  `💡 Check:\n• Server is running at ${API_BASE}\n• /preview endpoint exists\n• Backend is properly deployed`;
                     } else if (response.status === 502) {
                         errorMsg = `Processing failed (502 Bad Gateway)\n` +
                                   `${errorData.detail || errorData.message || 'Server processing error'}\n\n` +
@@ -766,6 +818,8 @@
             } finally {
                 processBtn.disabled = false;
                 processBtn.textContent = '🎯 Generate Professional Clean Version';
+                dropZone.classList.remove('disabled');
+                fileInputLocked = false;
             }
         }
 
@@ -861,22 +915,39 @@
             try {
                 console.log(`[CONNECTION_CHECK] Testing ${API_BASE}`);
                 
-                const response = await fetch(`${API_BASE}/health`, {
+                // First try the root endpoint
+                let response = await fetch(`${API_BASE}/`, {
                     method: 'GET',
                     headers: { 'Accept': 'application/json' }
                 });
 
                 if (response.ok) {
                     const data = await response.json();
-                    console.log('[HEALTH_CHECK]', data);
+                    console.log('[ROOT_CHECK]', data);
                     
                     serverOnline = true;
+                    updateConnectionStatus('connected', '✅ Professional cleaning server ready');
                     
-                    if (data.environment?.has_cloudflare_credentials === false) {
-                        updateConnectionStatus('connected', '⚠️ Server online but missing Cloudflare credentials');
-                    } else {
-                        updateConnectionStatus('connected', '✅ Professional cleaning server ready');
+                    // Try to check health endpoint if it exists
+                    try {
+                        const healthResponse = await fetch(`${API_BASE}/health`, {
+                            method: 'GET',
+                            headers: { 'Accept': 'application/json' }
+                        });
+                        
+                        if (healthResponse.ok) {
+                            const healthData = await healthResponse.json();
+                            console.log('[HEALTH_CHECK]', healthData);
+                            
+                            if (healthData.environment?.has_cloudflare_credentials === false) {
+                                updateConnectionStatus('connected', '⚠️ Server online but missing Cloudflare credentials');
+                            }
+                        }
+                    } catch (healthError) {
+                        console.log('[HEALTH_CHECK] Not available:', healthError.message);
+                        // Health check failed but root works, that's okay
                     }
+                    
                 } else {
                     throw new Error(`Server responded with ${response.status}`);
                 }
@@ -899,6 +970,7 @@
 
         // Initialize connection check on page load
         document.addEventListener('DOMContentLoaded', () => {
+            console.log('[INIT] Page loaded - checking server connection');
             checkServerConnection();
             
             // Recheck connection every 30 seconds
