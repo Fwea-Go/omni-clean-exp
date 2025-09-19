@@ -652,6 +652,12 @@
                 console.error('Health check failed:', error);
                 showError('⚠️ Unable to connect to processing server. Please check your connection and try again.');
             });
+
+        // Version marker fetch (helps confirm we are hitting the right API host)
+        fetch(`${API_BASE}/__version`)
+            .then(r => r.json())
+            .then(v => console.log('API Version:', v))
+            .catch(err => console.warn('Version check failed:', err));
     </script>
 </body>
 </html>
