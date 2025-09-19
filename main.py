@@ -232,6 +232,18 @@ async def health():
         }
     }
 
+# Version marker endpoint for quick sanity checks
+@app.get("/__version")
+async def version():
+    return {
+        "ok": True,
+        "backend": "fastapi",
+        "name": "FWEA-I Clean Editor API (Optimized)",
+        "version": "2.0",
+        "build": "ladder-1 mp3/opus chunks",
+        "time": time.time()
+    }
+
 @app.post("/preview")
 async def preview(file: UploadFile = File(...)):
     start_time = time.time()
