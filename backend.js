@@ -56,16 +56,24 @@ app.use(cors({ origin: '*' }));
 app.use('/public', express.static(path.join(process.cwd(), 'public')));
 app.options('/preview', cors());
 
-// Enhanced profanity detection
-const badWords = [
-    /\b(fuck|shit|bitch|asshole|cunt|motherfucker|dick|pussy|nigga|nigger|hoe|slut)\b/i,
-    /\b(puta|puto|pendejo|mierda|cabron|coño)\b/i,
-    /\b(putain|merde|salope|con)\b/i,
-    /\b(bitch|koko|vagin|kaka|manmanw|manman'w)\b/i,
-    /\b(merda|caralho|porra|puta)\b/i,
-];
+// Aggressive profanity detection regex (catches leetspeak/obfuscated variants)
+const PROFANITY_RE = new RegExp(
+  String.raw`\b(?:f[\W_]*u[\W_]*c[\W_]*k+|s[\W_]*h[\W_]*i[\W_]*t+|b[\W_]*i[\W_]*t[\W_]*c[\W_]*h+|n[\W_]*i[\W_]*g+[\W_]*a+)\b`,
+  'i'
+);
 
-const hasBad = (txt = '') => badWords.some(rx => rx.test(txt));
+const LEET_MAP = { '@':'a', '$':'s', '0':'o', '1':'i', '!':'i', '3':'e', '4':'a', '5':'s', '7':'t' };
+function normToken(s='') {
+    s = String(s || '').toLowerCase();
+    s = s.replace(/[@$013457!]/g, ch => LEET_MAP[ch] || ch);
+    return s.replace(/[^a-z]+/g, '');
+}
+const hasBad = (txt = '') => {
+    return PROFANITY_RE.test(txt) || PROFANITY_RE.test(normToken(txt));
+};
+
+const MUTE_PAD = 0.15;  // seconds
+const MERGE_GAP = 0.12; // seconds
 
 app.get('/', (_req, res) => res.json({ 
     ok: true, 
@@ -202,7 +210,10 @@ app.post('/preview', upload.single('file'), async (req, res) => {
                     timeout: 60000 // 60s timeout
                 });
 
-                const j = await cf.json().catch(() => ({}));
+                const text = await cf.text();
+                let j = {};
+                try { j = JSON.parse(text); }
+                catch { return { ok: false, error: { message: 'Whisper parse failed', detail: text }, isTooLarge: false, isRateLimit: false, shouldRetry: false }; }
 
                 if (!cf.ok) {
                     const errorInfo = {
@@ -249,15 +260,16 @@ app.post('/preview', upload.single('file'), async (req, res) => {
         const segments = [];
         let language = 'auto';
         const total = Math.max(0, dur) || INITIAL_CHUNK_SEC;
-        
+
         let retryCount = 0;
         const maxRetries = 3;
+        let spans = [];
 
         for (let start = 0; start < total; start += INITIAL_CHUNK_SEC) {
             const len = Math.min(INITIAL_CHUNK_SEC, total - start);
             let currentLen = len;
             let success = false;
-            
+
             // Try multiple optimization levels for this chunk
             for (let level = 1; level <= 5 && !success; level++) {
                 try {
@@ -280,16 +292,31 @@ app.post('/preview', upload.single('file'), async (req, res) => {
                         for (const s of segs) {
                             const st = Number(s.start) || 0;
                             const en = Number(s.end) || 0;
-                            segments.push({ 
-                                start: st + start, 
-                                end: en + start, 
-                                text: s.text || '' 
+                            const txt = s.text || '';
+                            segments.push({
+                                start: st + start,
+                                end: en + start,
+                                text: txt
                             });
+                            const words = Array.isArray(s.words) ? s.words : [];
+                            for (const w of words) {
+                                const wtxt = (w.word || '').trim();
+                                if (!wtxt) continue;
+                                if (hasBad(wtxt)) {
+                                    const wst = (Number(w.start) || st) + start;
+                                    const wen = (Number(w.end) || en) + start;
+                                    spans.push({
+                                        start: Math.max(0, wst - MUTE_PAD),
+                                        end: Math.max(0, wen + MUTE_PAD),
+                                        reason: 'profanity'
+                                    });
+                                }
+                            }
                         }
-                        
+
                         success = true;
                         console.log(`[success] chunk ${start.toFixed(1)}s processed with level ${level}`);
-                        
+
                     } else if (r.shouldRetry && level < 5) {
                         console.log(`[retry] chunk ${start.toFixed(1)}s failed at level ${level}, trying level ${level + 1}`);
                         continue;
@@ -302,7 +329,7 @@ app.post('/preview', upload.single('file'), async (req, res) => {
                             continue;
                         }
                     }
-                    
+
                     if (!success && level === 5) {
                         throw new Error(`All optimization levels failed for chunk at ${start.toFixed(1)}s: ${JSON.stringify(r.error)}`);
                     }
@@ -321,27 +348,33 @@ app.post('/preview', upload.single('file'), async (req, res) => {
             }
         }
 
-        // Build profanity spans
-        const spans = [];
-        for (const s of segments) {
-            if (hasBad(s.text)) {
-                spans.push({ 
-                    start: Math.max(0, s.start), 
-                    end: Math.max(0, s.end), 
-                    reason: 'profanity' 
-                });
+        // Build profanity spans with word-level precision (if available), else fallback
+        if (!spans || !Array.isArray(spans)) { spans = []; }
+        if (spans.length === 0) {
+            for (const s of segments) {
+                if (hasBad(s.text)) {
+                    spans.push({
+                        start: Math.max(0, s.start - MUTE_PAD),
+                        end: Math.max(0, s.end + MUTE_PAD),
+                        reason: 'profanity'
+                    });
+                }
             }
         }
 
         spans.sort((a, b) => a.start - b.start);
 
-        // Merge overlapping spans
+        // Merge overlapping/nearby spans
         const merged = [];
         for (const s of spans) {
-            if (!merged.length || s.start > merged[merged.length - 1].end) {
+            if (!merged.length) {
                 merged.push({ ...s });
-            } else {
+                continue;
+            }
+            if (s.start <= merged[merged.length - 1].end + MERGE_GAP) {
                 merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, s.end);
+            } else {
+                merged.push({ ...s });
             }
         }
 
