@@ -569,8 +569,12 @@
                 console.error('Processing error:', error);
                 hideProgress();
                 
-                let errorMsg = error.message || 'An unexpected error occurred.';
-                
+                let errorMsg;
+                if (error && typeof error === 'object') {
+                    errorMsg = error.message || JSON.stringify(error);
+                } else {
+                    errorMsg = String(error);
+                }
                 // Add helpful suggestions based on error type
                 if (errorMsg.includes('too large') || errorMsg.includes('413') || errorMsg.includes('502')) {
                     errorMsg += '\n\n💡 Suggestions:\n' +
@@ -578,7 +582,6 @@
                                '• Compress your audio file (lower bitrate/sample rate)\n' +
                                '• Convert to MP3 format for better compression';
                 }
-                
                 showError(errorMsg);
             } finally {
                 processBtn.disabled = false;
