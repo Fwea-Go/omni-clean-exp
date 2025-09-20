@@ -15,22 +15,26 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 WHISPER_MODEL = "@cf/openai/whisper"
 
-# Enhanced multilingual profanity detection
-BAD_WORDS = [
-    # English
-    r"\b(fuck|shit|bitch|asshole|cunt|motherfucker|dick|pussy|nigga|nigger|hoe|slut)\b",
-    # Spanish
-    r"\b(puta|puto|pendejo|mierda|cabron|coño)\b",
-    # French
-    r"\b(putain|merde|salope|con)\b",
-    # Haitian Creole
-    r"\b(bitch|koko|vagin|kaka|manmanw|manman'w)\b",
-    # Portuguese
-    r"\b(merda|caralho|porra|puta)\b",
-    # Add more languages as needed
-]
+import re
+# Aggressive profanity detection regex (catches leetspeak/obfuscated variants)
+PROFANITY_RE = re.compile(
+    r'\b(?:f[\W_]*u[\W_]*c[\W_]*k+|s[\W_]*h[\W_]*i[\W_]*t+|b[\W_]*i[\W_]*t[\W_]*c[\W_]*h+|n[\W_]*i[\W_]*g+[\W_]*a+)\b',
+    re.I
+)
 
-BAD_RE = re.compile("|".join(BAD_WORDS), flags=re.IGNORECASE)
+# Normalize tokens to catch leetspeak/obfuscations (e.g., f*ck, f@ck, f#ck)
+LEET_MAP = str.maketrans({
+    '@':'a','$':'s','0':'o','1':'i','!':'i','3':'e','4':'a','5':'s','7':'t'
+})
+def norm_token(s: str) -> str:
+    s = (s or '').lower()
+    s = s.translate(LEET_MAP)
+    s = re.sub(r'[^a-z]+', '', s)  # strip non-letters
+    return s
+
+# pad around detected words to avoid clicks, and merge close gaps
+MUTE_PAD = 0.15   # seconds before/after
+MERGE_GAP = 0.12  # merge spans separated by <= this
 
 # File size limits
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
@@ -298,6 +302,7 @@ async def preview(file: UploadFile = File(...)):
         # Process in smaller chunks
         INITIAL_CHUNK_SEC = 2.0  # Start with 2s chunks
         full_segments = []
+        word_spans = []  # word-level profanity hit windows
         language = "auto"
         
         retry_count = 0
@@ -315,45 +320,61 @@ async def preview(file: UploadFile = File(...)):
                     slice_path = make_optimized_slice(src, t, chunk_length, level)
                     temp_files.append(slice_path)
                     
-                    # Call Whisper API
-                    result = whisper_file_enhanced(slice_path, level)
-                    
-                    if result["success"]:
-                        data = result["data"]
-                        result_data = data.get("result", data)
-                        
-                        if result_data.get("language"):
-                            language = result_data["language"]
-                        
-                        segments = result_data.get("segments", [])
-                        for s in segments:
-                            st = float(s.get("start", 0.0)) + t
-                            en = float(s.get("end", 0.0)) + t
-                            full_segments.append({
-                                "start": st,
-                                "end": en,
-                                "text": s.get("text", "")
-                            })
-                        
-                        success = True
-                        print(f"[success] chunk {t:.1f}s processed with level {level}")
-                        break
-                        
-                    elif result["should_retry"] and level < 5:
-                        print(f"[retry] chunk {t:.1f}s failed at level {level}, trying level {level + 1}")
-                        continue
-                        
-                    elif result["is_rate_limit"]:
-                        print("[rate-limit] waiting 2s...")
-                        await asyncio.sleep(2)
-                        if retry_count < max_retries:
-                            retry_count += 1
-                            level -= 1  # Retry same level
-                            continue
-                    
-                    if level == 5:
-                        raise Exception(f"All optimization levels failed: {result['error']}")
-                        
+                    # Call Whisper API with robust error handling
+                    import aiohttp
+                    WHISPER_URL = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{WHISPER_MODEL}"
+                    headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
+                    data = {"input": json.dumps({"response_format": "verbose_json"})}
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            with open(slice_path, "rb") as f:
+                                mime = "audio/ogg" if slice_path.lower().endswith(".ogg") else "audio/mpeg"
+                                form = aiohttp.FormData()
+                                form.add_field("input", json.dumps({"response_format": "verbose_json"}))
+                                form.add_field("file", f, filename=os.path.basename(slice_path), content_type=mime)
+                                try:
+                                    async with session.post(WHISPER_URL, data=form, headers=headers) as resp:
+                                        text = await resp.text()
+                                        try:
+                                            out = json.loads(text)
+                                        except Exception:
+                                            return web.json_response({"error": "Whisper parse failed", "detail": text}, status=502)
+                                except Exception as e:
+                                    return web.json_response({"error": "Whisper request failed", "detail": str(e)}, status=502)
+                    except Exception as e:
+                        return web.json_response({"error": "Whisper request failed", "detail": str(e)}, status=502)
+                    # If we got here, out is parsed JSON
+                    data = out.get("result", out)
+                    if data.get("language"):
+                        language = data["language"]
+                    segments = data.get("segments", [])
+                    for s in segments:
+                        st = float(s.get("start", 0.0)) + t
+                        en = float(s.get("end", 0.0)) + t
+                        txt = s.get("text", "") or ""
+                        full_segments.append({
+                            "start": st,
+                            "end": en,
+                            "text": txt
+                        })
+                        # If word timestamps are present, inspect each word for profanity
+                        words = s.get("words") or []
+                        for w in words:
+                            wtxt = str(w.get("word","")).strip()
+                            if not wtxt:
+                                continue
+                            nrm = norm_token(wtxt)
+                            if nrm and PROFANITY_RE.search(wtxt) or PROFANITY_RE.search(nrm):
+                                wst = float(w.get("start", st)) + t
+                                wen = float(w.get("end", en)) + t
+                                word_spans.append({
+                                    "start": max(0.0, wst - MUTE_PAD),
+                                    "end": max(0.0, wen + MUTE_PAD),
+                                    "reason": "profanity"
+                                })
+                    success = True
+                    print(f"[success] chunk {t:.1f}s processed with level {level}")
+                    break
                 except Exception as e:
                     print(f"[error] level {level}: {e}")
                     if level == 5:
@@ -369,27 +390,34 @@ async def preview(file: UploadFile = File(...)):
             
             t += INITIAL_CHUNK_SEC
         
-        # Build profanity spans
+        # Build profanity spans with word-level precision when available
         transcript_text = " ".join(s.get("text", "").strip() for s in full_segments).strip()
-        
-        spans = []
-        for s in full_segments:
-            if BAD_RE.search(s.get("text", "")):
-                spans.append({
-                    "start": max(0.0, s["start"]),
-                    "end": max(0.0, s["end"]),
-                    "reason": "profanity"
-                })
-        
+
+        # Prefer word-level hits; otherwise fall back to segment-level text scan
+        spans = list(word_spans)
+        if not spans:
+            for s in full_segments:
+                txt = s.get("text", "")
+                nrm = norm_token(txt)
+                if PROFANITY_RE.search(txt) or PROFANITY_RE.search(nrm):
+                    spans.append({
+                        "start": max(0.0, s["start"] - MUTE_PAD),
+                        "end": max(0.0, s["end"] + MUTE_PAD),
+                        "reason": "profanity"
+                    })
+
         spans.sort(key=lambda x: x["start"])
-        
-        # Merge overlapping spans
+
+        # Merge overlapping/nearby spans
         merged = []
         for s in spans:
-            if not merged or s["start"] > merged[-1]["end"]:
+            if not merged:
                 merged.append(dict(s))
-            else:
+                continue
+            if s["start"] <= merged[-1]["end"] + MERGE_GAP:
                 merged[-1]["end"] = max(merged[-1]["end"], s["end"])
+            else:
+                merged.append(dict(s))
         
         # Generate preview
         PREVIEW_T = 30.0
